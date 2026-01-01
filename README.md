@@ -25,10 +25,10 @@ To build, have Go installed (e.g., `apt install golang`) then `make` (or just
 `go build`). There is a convenience target `make install` to copy the binary to
 `/usr/local/bin` but you can of course just put it anywhere.
 
-See [mdns-repeater.service] for an example systemd unit and modify it to suit
-your needs. Put in `/etc/systemd/system`, then `systemctl daemon-reload` and
-`systemctl start mdns-repeater.service`. Or whatever you use to run stuff
-in the background.
+See [mdns-repeater.service](mdns-repeater.service) for an example systemd unit
+and modify it to suit your needs. Put it in `/etc/systemd/system`, then run
+`systemctl daemon-reload` and `systemctl start mdns-repeater.service`. Or use
+whatever you use to run stuff in the background, if not systemd.
 
 ## Usage
 
