@@ -19,6 +19,17 @@ need to run Avahi (without reflector) if you wish to be discoverable.
 
 ~ [Kimmo Kulovesi](https://github.com/arkku/), 2026-01-01
 
+## Installation
+
+To build, have Go installed (e.g., `apt install golang`) then `make` (or just
+`go build`). There is a convenience target `make install` to copy the binary to
+`/usr/local/bin` but you can of course just put it anywhere.
+
+See [mdns-repeater.service] for an example systemd unit and modify it to suit
+your needs. Put in `/etc/systemd/system`, then `systemctl daemon-reload` and
+`systemctl start mdns-repeater.service`. Or whatever you use to run stuff
+in the background.
+
 ## Usage
 
 The basic use is to list comma-separated interfaces after `-i`, or you can use
