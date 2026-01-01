@@ -21,11 +21,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -244,6 +246,13 @@ type Server struct {
 
 func (server *Server) log(format string, args ...any) {
 	log.Printf(server.prefix+": "+format, args...)
+}
+
+func (server *Server) Close() error {
+	if server.conn != nil {
+		return server.conn.Close()
+	}
+	return nil
 }
 
 func (server *Server) configureListener() error {
@@ -626,8 +635,20 @@ func main() {
 		go s.Run(&wg, errCh)
 	}
 
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
 	go func() { wg.Wait(); close(errCh) }()
-	if err := <-errCh; err != nil {
-		log.Fatalf("Fatal error: %v", err)
+
+	select {
+	case sig := <-sigCh:
+		log.Printf("Received %v, shutting down...", sig)
+		for _, s := range servers {
+			s.Close()
+		}
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Fatalf("Fatal error: %v", err)
+		}
 	}
 }
