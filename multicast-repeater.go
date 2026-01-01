@@ -39,8 +39,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Version can be set at build time with -ldflags "-X main.Version=x.y.z"
+var Version = ""
+
 func version() string {
-	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+	if Version != "" {
+		return Version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
 		return info.Main.Version
 	}
 	return "dev"

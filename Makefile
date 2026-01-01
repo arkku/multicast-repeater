@@ -5,10 +5,13 @@ DESTDIR ?= /usr/local
 BINDIR=$(DESTDIR)/bin
 INSTALL=$(BINDIR)/$(BIN)
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS = -X main.Version=$(VERSION)
+
 all: $(BIN)
 
 $(BIN): $(SRC)
-	go build -o $@
+	go build -ldflags "$(LDFLAGS)" -o $@
 
 $(BINDIR)/$(BIN): $(BIN) $(BINDIR)
 	install $< "$@"
