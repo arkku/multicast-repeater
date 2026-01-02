@@ -12,11 +12,11 @@ be overridden for specific interfaces if desired, or kept unchanged from
 the original packet.)
 
 I made this with the help of AI because Avahi seems to modify the packets
-and this causes some issues with more picky IoT devices.
+and this causes some issues with the more picky IoT devices.
 
 Note that this does not do anything for broadcast or unicast packets;
 another reflector (or nftables `dup` rule) is needed for those. And you still
-need to run Avahi (without reflector) if you wish to be discoverable.
+need to run Avahi (without the reflector) if you wish to be discoverable.
 
 ~ [Kimmo Kulovesi](https://github.com/arkku/), 2026-01-01
 
@@ -87,14 +87,14 @@ the list of protocol presets there.
 mDNS is the default mode. Simply list your interfaces after `-i` for both IPv4
 and IPv6.
 
-```
+``` sh
 multicast-repeater -i lan-main,lan-iot,lan-admin
 ```
 
 Or, if you have VLANs that are IPv4 only, in this example `lan-admin` uses only
 IPv4 (note that `-i` expects both to be available and fails if one isn't):
 
-```
+``` sh
 multicast-repeater -4 lan-main,lan-iot,lan-admin -6 lan-main,lan-iot 
 ```
 
@@ -107,7 +107,7 @@ ways, though, or M-SEARCH active search won't work to such a VLAN (i.e., devices
 on that VLAN will only be found after they announce themselves, which might
 take a while).
 
-```
+``` sh
 multicast-repeater -i lan-main,lan-iot=in,lan-admin -protocol ssdp
 ```
 
