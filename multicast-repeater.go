@@ -717,12 +717,12 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 
 		// With keepSource, verify the source is on the interface's subnet,
 		// since we can't avoid looping by just checking against our own IP.
-		if server.keepSource && len(inCfg.Subnets) > 0 && !inCfg.ContainsIP(srcUDP.IP) {
+		if server.keepSource && !inCfg.ContainsIP(srcUDP.IP) {
 			prefix := ipToPrefix(srcUDP.IP)
 
 			// If we haven't seen this prefix, try reloading subnets (might be new, e.g., via IPv6 RA)
 			if !externalPrefixes[prefix] {
-				// Rate-limit just to be safe
+				// Rate-limit reloads, just in case
 				now := time.Now()
 				if now.Sub(lastSubnetReload) >= subnetReloadInterval {
 					lastSubnetReload = now
