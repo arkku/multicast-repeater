@@ -130,6 +130,258 @@ type InterfaceConfig struct {
 	Direction Direction
 }
 
+// rawSender sends UDP packets with arbitrary source IPs using raw sockets.
+// This is needed for protocols like SSDP where unicast replies must reach
+// the original sender, not the repeater.
+type rawSender struct {
+	family  IPFamily
+	sockets map[int]int // ifIndex -> raw socket fd
+}
+
+func newRawSender(family IPFamily, ifaces map[int]*InterfaceConfig) (*rawSender, error) {
+	rs := &rawSender{
+		family:  family,
+		sockets: make(map[int]int),
+	}
+
+	for ifIndex, cfg := range ifaces {
+		if !cfg.Direction.Output {
+			continue
+		}
+
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+		if family == IPv6 {
+			fd, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+		}
+		if err != nil {
+			rs.Close()
+			return nil, fmt.Errorf("create raw socket for %s: %w", cfg.Interface.Name, err)
+		}
+
+		if family == IPv4 {
+			if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+				syscall.Close(fd)
+				rs.Close()
+				return nil, fmt.Errorf("set IP_HDRINCL for %s: %w", cfg.Interface.Name, err)
+			}
+		}
+
+		// Bind socket to specific interface (Linux-specific)
+		if err := unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, cfg.Interface.Name); err != nil {
+			syscall.Close(fd)
+			rs.Close()
+			return nil, fmt.Errorf("bind to %s: %w", cfg.Interface.Name, err)
+		}
+
+		rs.sockets[ifIndex] = fd
+	}
+
+	return rs, nil
+}
+
+func (rs *rawSender) Close() {
+	for _, fd := range rs.sockets {
+		syscall.Close(fd)
+	}
+}
+
+func (rs *rawSender) Send(ifIndex int, srcIP, dstIP net.IP, srcPort, dstPort, ttl int, payload []byte) error {
+	fd, ok := rs.sockets[ifIndex]
+	if !ok {
+		return fmt.Errorf("no raw socket for interface %d", ifIndex)
+	}
+
+	var packet []byte
+	var sa syscall.Sockaddr
+
+	if rs.family == IPv4 {
+		packet = buildIPv4UDPPacket(srcIP, dstIP, uint16(srcPort), uint16(dstPort), uint8(ttl), payload)
+		sa = &syscall.SockaddrInet4{Port: 0}
+		copy(sa.(*syscall.SockaddrInet4).Addr[:], dstIP.To4())
+	} else {
+		packet = buildIPv6UDPPacket(srcIP, dstIP, uint16(srcPort), uint16(dstPort), uint8(ttl), payload)
+		sa = &syscall.SockaddrInet6{Port: 0}
+		copy(sa.(*syscall.SockaddrInet6).Addr[:], dstIP.To16())
+	}
+
+	return syscall.Sendto(fd, packet, 0, sa)
+}
+
+func buildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, ttl uint8, payload []byte) []byte {
+	const ipHeaderLen = 20
+	const udpHeaderLen = 8
+	totalLen := ipHeaderLen + udpHeaderLen + len(payload)
+
+	packet := make([]byte, totalLen)
+
+	// IPv4 header
+	packet[0] = 0x45                // Version 4, IHL 5 (20 bytes)
+	packet[1] = 0                   // DSCP + ECN
+	packet[2] = byte(totalLen >> 8) // Total length (big endian)
+	packet[3] = byte(totalLen)
+	// packet[4:6] = ID (0)
+	// packet[6:8] = Flags + Fragment offset (0)
+	packet[8] = ttl
+	packet[9] = syscall.IPPROTO_UDP
+	// packet[10:12] = checksum, filled below
+	copy(packet[12:16], srcIP.To4())
+	copy(packet[16:20], dstIP.To4())
+
+	// IP header checksum
+	csum := ipChecksum(packet[:ipHeaderLen])
+	packet[10] = byte(csum >> 8)
+	packet[11] = byte(csum)
+
+	// UDP header
+	packet[20] = byte(srcPort >> 8)
+	packet[21] = byte(srcPort)
+	packet[22] = byte(dstPort >> 8)
+	packet[23] = byte(dstPort)
+	udpLen := uint16(udpHeaderLen + len(payload))
+	packet[24] = byte(udpLen >> 8)
+	packet[25] = byte(udpLen)
+	// packet[26:28] = UDP checksum, filled below
+
+	// Payload
+	copy(packet[28:], payload)
+
+	// UDP checksum (optional for IPv4, but some receivers may expect it)
+	csum = udp4Checksum(srcIP, dstIP, packet[20:])
+	packet[26] = byte(csum >> 8)
+	packet[27] = byte(csum)
+
+	return packet
+}
+
+func buildIPv6UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, hopLimit uint8, payload []byte) []byte {
+	const ipv6HeaderLen = 40
+	const udpHeaderLen = 8
+	udpLen := udpHeaderLen + len(payload)
+	totalLen := ipv6HeaderLen + udpLen
+
+	packet := make([]byte, totalLen)
+
+	// IPv6 header
+	packet[0] = 0x60 // Version 6
+	// packet[1:4] = Traffic class + Flow label (0)
+	packet[4] = byte(udpLen >> 8) // Payload length
+	packet[5] = byte(udpLen)
+	packet[6] = syscall.IPPROTO_UDP // Next header
+	packet[7] = hopLimit
+	copy(packet[8:24], srcIP.To16())
+	copy(packet[24:40], dstIP.To16())
+
+	// UDP header
+	packet[40] = byte(srcPort >> 8)
+	packet[41] = byte(srcPort)
+	packet[42] = byte(dstPort >> 8)
+	packet[43] = byte(dstPort)
+	packet[44] = byte(udpLen >> 8)
+	packet[45] = byte(udpLen)
+	// packet[46:48] = UDP checksum, required for IPv6
+
+	// Payload
+	copy(packet[48:], payload)
+
+	// UDP checksum (required for IPv6)
+	csum := udp6Checksum(srcIP, dstIP, packet[40:])
+	packet[46] = byte(csum >> 8)
+	packet[47] = byte(csum)
+
+	return packet
+}
+
+func ipChecksum(data []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(data); i += 2 {
+		sum += uint32(data[i])<<8 | uint32(data[i+1])
+	}
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func udp4Checksum(srcIP, dstIP net.IP, udpPacket []byte) uint16 {
+	// Pseudo-header: src IP (4) + dst IP (4) + zero (1) + protocol (1) + UDP length (2)
+	var sum uint32
+
+	src := srcIP.To4()
+	sum += uint32(src[0])<<8 | uint32(src[1])
+	sum += uint32(src[2])<<8 | uint32(src[3])
+
+	dst := dstIP.To4()
+	sum += uint32(dst[0])<<8 | uint32(dst[1])
+	sum += uint32(dst[2])<<8 | uint32(dst[3])
+
+	sum += uint32(syscall.IPPROTO_UDP)
+	sum += uint32(len(udpPacket))
+
+	// UDP packet (with checksum field as zero)
+	for i := 0; i+1 < len(udpPacket); i += 2 {
+		if i == 6 {
+			continue // Skip checksum field
+		}
+		sum += uint32(udpPacket[i])<<8 | uint32(udpPacket[i+1])
+	}
+	if len(udpPacket)%2 == 1 {
+		sum += uint32(udpPacket[len(udpPacket)-1]) << 8
+	}
+
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+
+	result := ^uint16(sum)
+	if result == 0 {
+		result = 0xffff // Per RFC 768, 0 means "no checksum", so use 0xffff instead
+	}
+	return result
+}
+
+func udp6Checksum(srcIP, dstIP net.IP, udpPacket []byte) uint16 {
+	// Pseudo-header for IPv6 UDP checksum
+	var sum uint32
+
+	// Source address (16 bytes)
+	src := srcIP.To16()
+	for i := 0; i < 16; i += 2 {
+		sum += uint32(src[i])<<8 | uint32(src[i+1])
+	}
+
+	// Destination address (16 bytes)
+	dst := dstIP.To16()
+	for i := 0; i < 16; i += 2 {
+		sum += uint32(dst[i])<<8 | uint32(dst[i+1])
+	}
+
+	// UDP length (4 bytes, upper 2 are zero for lengths < 65536)
+	udpLen := len(udpPacket)
+	sum += uint32(udpLen)
+
+	// Next header (1 byte, but padded to 4)
+	sum += uint32(syscall.IPPROTO_UDP)
+
+	// UDP packet
+	for i := 0; i+1 < udpLen; i += 2 {
+		if i == 6 {
+			continue // Skip checksum field itself
+		}
+		sum += uint32(udpPacket[i])<<8 | uint32(udpPacket[i+1])
+	}
+	if udpLen%2 == 1 {
+		sum += uint32(udpPacket[udpLen-1]) << 8
+	}
+
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
 func parseInterfaceList(list string, family IPFamily, overrides map[string]string) (map[int]*InterfaceConfig, error) {
 	result := map[int]*InterfaceConfig{}
 	if list == "" {
@@ -248,6 +500,7 @@ type Server struct {
 	keepSource bool
 
 	conn        net.PacketConn
+	rawSender   *rawSender // used to send packets with unowned IPs
 	readPacket  func([]byte) (int, int, net.IP, net.Addr, int, error)
 	writePacket func([]byte, int, net.IP, *net.UDPAddr, int) error
 }
@@ -257,6 +510,9 @@ func (server *Server) log(format string, args ...any) {
 }
 
 func (server *Server) Close() error {
+	if server.rawSender != nil {
+		server.rawSender.Close()
+	}
 	if server.conn != nil {
 		return server.conn.Close()
 	}
@@ -446,17 +702,30 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			if outIfIndex == inIfIndex || !outCfg.Direction.Output {
 				continue
 			}
-			outSrcIP := sourceByInterface[outIfIndex]
-			if server.keepSource && srcUDP != nil && outCfg.Override == nil {
-				outSrcIP = srcUDP.IP
-			}
+
+			// Use raw sender when keepSource is enabled (to support non-owned source IPs)
+			useRaw := server.rawSender != nil && srcUDP != nil
+
 			if server.verbose {
 				server.log("Repeating from %s %s to %s (%d bytes)",
 					inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, len(payload))
 			}
-			dst := &net.UDPAddr{IP: server.group, Port: server.port}
-			if err := server.writePacket(payload, outIfIndex, outSrcIP, dst, ttlOrHop); err != nil {
-				server.log("Warning: write to %s failed: %v", outCfg.Interface.Name, err)
+
+			var err error
+			if useRaw {
+				srcIP := srcUDP.IP
+				if outCfg.Override != nil {
+					srcIP = outCfg.Override
+				}
+				err = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, ttlOrHop, payload)
+			} else {
+				outSrcIP := sourceByInterface[outIfIndex]
+				dst := &net.UDPAddr{IP: server.group, Port: server.port}
+				err = server.writePacket(payload, outIfIndex, outSrcIP, dst, ttlOrHop)
+			}
+			if err != nil {
+				errCh <- fmt.Errorf("write to %s: %w", outCfg.Interface.Name, err)
+				return
 			}
 		}
 	}
@@ -505,7 +774,17 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 		wildcard:   wildcard,
 		keepSource: keepSource,
 	}
+
+	if keepSource {
+		rs, err := newRawSender(family, ifaces)
+		if err != nil {
+			return nil, fmt.Errorf("raw sender: %w", err)
+		}
+		s.rawSender = rs
+	}
+
 	if err := s.configureListener(); err != nil {
+		s.Close()
 		return nil, err
 	}
 	return s, nil
