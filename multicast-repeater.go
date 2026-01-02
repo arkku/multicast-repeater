@@ -24,6 +24,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -382,6 +384,57 @@ func udp6Checksum(srcIP, dstIP net.IP, udpPacket []byte) uint16 {
 	return ^uint16(sum)
 }
 
+// packetCache tracks recently seen packets to prevent forwarding loops.
+// When keepSource is enabled, we can't identify our own packets by source IP,
+// so we hash the packet contents and ignore duplicates within a time window.
+
+const (
+	packetCacheMaxAge  = 2 * time.Second
+	packetCacheMaxSize = 1000
+)
+
+type packetCache struct {
+	seen map[uint64]time.Time
+}
+
+func newPacketCache() *packetCache {
+	return &packetCache{
+		seen: make(map[uint64]time.Time),
+	}
+}
+
+func (pc *packetCache) hash(srcIP net.IP, payload []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(srcIP)
+	h.Write(payload)
+	return h.Sum64()
+}
+
+func (pc *packetCache) isDuplicate(srcIP net.IP, payload []byte) bool {
+	key := pc.hash(srcIP, payload)
+	now := time.Now()
+
+	// Check if we've seen this packet recently
+	if ts, ok := pc.seen[key]; ok && now.Sub(ts) < packetCacheMaxAge {
+		return true
+	}
+
+	// Add to cache
+	pc.seen[key] = now
+
+	// Periodic cleanup if cache is getting large
+	if len(pc.seen) > packetCacheMaxSize {
+		cutoff := now.Add(-packetCacheMaxAge)
+		for k, ts := range pc.seen {
+			if ts.Before(cutoff) {
+				delete(pc.seen, k)
+			}
+		}
+	}
+
+	return false
+}
+
 func parseInterfaceList(list string, family IPFamily, overrides map[string]string) (map[int]*InterfaceConfig, error) {
 	result := map[int]*InterfaceConfig{}
 	if list == "" {
@@ -655,11 +708,25 @@ func (server *Server) configureListener() error {
 	return nil
 }
 
+// ipToKey converts an IP to a fixed-size key without allocation.
+func ipToKey(ip net.IP) [16]byte {
+	var key [16]byte
+	if len(ip) == 16 {
+		copy(key[:], ip)
+	} else if len(ip) == 4 {
+		// IPv4-mapped IPv6 format: ::ffff:a.b.c.d
+		key[10] = 0xff
+		key[11] = 0xff
+		copy(key[12:], ip)
+	}
+	return key
+}
+
 func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	defer wg.Done()
 
 	sourceByInterface := make(map[int]net.IP)
-	ownSources := make(map[string]bool)
+	ownSources := make(map[[16]byte]bool)
 
 	for ifIndex, cfg := range server.ifaces {
 		if !cfg.Direction.Output {
@@ -667,10 +734,16 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 		}
 		srcIP := cfg.SourceAddress()
 		sourceByInterface[ifIndex] = srcIP
-		ownSources[srcIP.String()] = true
+		ownSources[ipToKey(srcIP)] = true
 		if server.verbose {
 			server.log("Output %s via %s", cfg.Interface.Name, srcIP)
 		}
+	}
+
+	// Packet cache for loop prevention when keepSource is enabled
+	var pktCache *packetCache
+	if server.keepSource {
+		pktCache = newPacketCache()
 	}
 
 	buf := make([]byte, maxPacketSize)
@@ -688,8 +761,20 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			continue
 		}
 
-		// Loop prevention: ignore packets from our own source addresses.
-		if srcUDP, ok := srcAddr.(*net.UDPAddr); ok && ownSources[srcUDP.IP.String()] {
+		srcUDP, _ := srcAddr.(*net.UDPAddr)
+
+		// Loop prevention
+		if pktCache != nil && srcUDP != nil {
+			// With keepSource, we can't identify our packets by source IP,
+			// so we use srcIP+payload hashing to detect duplicates.
+			if pktCache.isDuplicate(srcUDP.IP, buf[:n]) {
+				if server.verbose {
+					server.log("Ignoring duplicate packet on %s from %s", inCfg.Interface.Name, srcUDP.IP)
+				}
+				continue
+			}
+		} else if srcUDP != nil && ownSources[ipToKey(srcUDP.IP)] {
+			// Without keepSource, check if source is one of our own IPs.
 			if server.verbose {
 				server.log("Ignoring own packet on %s from %s", inCfg.Interface.Name, srcUDP.IP)
 			}
@@ -697,7 +782,6 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 		}
 
 		payload := append([]byte(nil), buf[:n]...)
-		srcUDP, _ := srcAddr.(*net.UDPAddr)
 		for outIfIndex, outCfg := range server.ifaces {
 			if outIfIndex == inIfIndex || !outCfg.Direction.Output {
 				continue
