@@ -7,8 +7,9 @@ can be specified as input only (listen on), output only (repeat to), or
 both (the default).
 
 The packets are preserved exactly as they are, other than the source address
-is changed to the address of the output interface. (The address can be
-overridden for specific interfaces is desired.)
+is changed to the address of the output interface for mDNS. (The address can
+be overridden for specific interfaces if desired, or kept unchanged from
+the original packet.)
 
 I made this with the help of AI because Avahi seems to modify the packets
 and this causes some issues with more picky IoT devices.
@@ -36,7 +37,7 @@ The basic use is to list comma-separated interfaces after `-i`, or you can use
 `-4` and/or `-6` to have separate lists of interfaces for IPv4 and IPv6 (there
 can be overlap).
 
-If you need undirectional repeating, you can add `=in` or `=out` after the
+If you need unidirectional repeating, you can add `=in` or `=out` after the
 interface name, e.g., `lan-main=out,lan-iot=in` would only repeat from `lan-iot`
 to `lan-main`, not the other way around. (In case there are only two interfaces
 the other label is technically redundant, but recommended anyway.)
@@ -52,6 +53,16 @@ By default the program binds to the multicast group addresses. This works on
 Linux, but if you need to bind to the wildcard address, you can do that with
 the option `-wildcard` (this still discards packets received on other
 interfaces). This is largely untested, though.
+
+For mDNS, the outgoing address is replaced with the address of the interface
+the packet is repeated on. This can be overridden with `-keep-source` to use
+the original source address, or with interface specific hardcoded addresses
+with `-override4` and/or `-override6` (e.g., to override the IPv4 source address
+on two interfaces, `-override4 lan-main=192.168.0.1,lan-iot=192.168.1.1`). For
+other protocols (like SSDP), the original source address is kept so that unicast
+replies can be routed to the original sender. This can be overridden with the
+flag `-replace-source` (but it will break active search across VLANs unless you
+run some other program on the repeater to handle that).
 
 You can verify the repeat is working with the `-v` option to add verbosity
 (prints a line for every repeated packet). The program does not fork, it is
@@ -81,9 +92,20 @@ multicast-repeater -4 lan-main,lan-iot,lan-admin -6 lan-main,lan-iot
 ### SSDP
 
 SSDP might not need to go both ways, in this example the interface `lan-iot` is
-only used as an input (i.e., make devices on that VLAN discoverable on others,
-but not able to discover devices on other VLANs).
+only used as an input (i.e., pass device self-announcements from `lan-iot` to
+other VLANs but not vice versa). In practice you probably want to repeat both
+ways, though, or M-SEARCH active search won't work to such a VLAN (i.e., devices
+on that VLAN will only be found after they announce themselves, which might
+take a while).
 
 ```
 multicast-repeater -i lan-main,lan-iot=in,lan-admin -protocol ssdp
 ```
+
+Note that SSDP preserves the original source address to support unicast
+replies, so if you do want active discovery to work across VLANs, you need to
+route the unicast replies back (allow port UDP 1900 across VLANs).
+
+(Some devices might intentionally reject packets from another subnet even if
+you repeat them correctly. There you might need something that proxies the
+replies, which this program doesn't.)

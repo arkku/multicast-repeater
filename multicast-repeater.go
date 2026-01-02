@@ -55,18 +55,19 @@ func version() string {
 const maxPacketSize = 9000
 
 type ProtocolPreset struct {
-	IPv4Group string
-	IPv6Group string
-	Port      int
+	IPv4Group  string
+	IPv6Group  string
+	Port       int
+	KeepSource bool // true for protocols with unicast replies to source IP
 }
 
 var protocolPresets = map[string]ProtocolPreset{
-	"mdns":         {"224.0.0.251", "ff02::fb", 5353},
-	"ssdp":         {"239.255.255.250", "ff02::c", 1900},
-	"ws-discovery": {"239.255.255.250", "ff02::c", 3702},
-	"llmnr":        {"224.0.0.252", "ff02::1:3", 5355},
-	"coap":         {"224.0.1.187", "ff02::fd", 5683},
-	"slp":          {"239.255.255.253", "ff02::116", 427},
+	"mdns":         {"224.0.0.251", "ff02::fb", 5353, false},
+	"ssdp":         {"239.255.255.250", "ff02::c", 1900, true},
+	"ws-discovery": {"239.255.255.250", "ff02::c", 3702, true},
+	"llmnr":        {"224.0.0.252", "ff02::1:3", 5355, true},
+	"coap":         {"224.0.1.187", "ff02::fd", 5683, true},
+	"slp":          {"239.255.255.253", "ff02::116", 427, true},
 }
 
 var defaultPreset = protocolPresets["mdns"]
@@ -237,13 +238,14 @@ func (cfg *InterfaceConfig) SourceAddress() net.IP {
 }
 
 type Server struct {
-	prefix   string
-	family   IPFamily
-	group    net.IP
-	port     int
-	ifaces   map[int]*InterfaceConfig
-	verbose  bool
-	wildcard bool
+	prefix     string
+	family     IPFamily
+	group      net.IP
+	port       int
+	ifaces     map[int]*InterfaceConfig
+	verbose    bool
+	wildcard   bool
+	keepSource bool
 
 	conn        net.PacketConn
 	readPacket  func([]byte) (int, int, net.IP, net.Addr, int, error)
@@ -439,11 +441,15 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 		}
 
 		payload := append([]byte(nil), buf[:n]...)
+		srcUDP, _ := srcAddr.(*net.UDPAddr)
 		for outIfIndex, outCfg := range server.ifaces {
 			if outIfIndex == inIfIndex || !outCfg.Direction.Output {
 				continue
 			}
 			outSrcIP := sourceByInterface[outIfIndex]
+			if server.keepSource && srcUDP != nil && outCfg.Override == nil {
+				outSrcIP = srcUDP.IP
+			}
 			if server.verbose {
 				server.log("Repeating from %s %s to %s (%d bytes)",
 					inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, len(payload))
@@ -456,7 +462,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	}
 }
 
-func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard bool) (*Server, error) {
+func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource bool) (*Server, error) {
 	ifaces, err := parseInterfaceList(interfaceList, family, overrides)
 	if err != nil {
 		return nil, err
@@ -490,13 +496,14 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 	}
 
 	s := &Server{
-		prefix:   family.String(),
-		family:   family,
-		group:    groupIP,
-		port:     port,
-		ifaces:   ifaces,
-		verbose:  verbose,
-		wildcard: wildcard,
+		prefix:     family.String(),
+		family:     family,
+		group:      groupIP,
+		port:       port,
+		ifaces:     ifaces,
+		verbose:    verbose,
+		wildcard:   wildcard,
+		keepSource: keepSource,
 	}
 	if err := s.configureListener(); err != nil {
 		return nil, err
@@ -531,6 +538,8 @@ func main() {
 	overrides4 := flag.String("override4", "", "IPv4 override outgoing address (iface=addr)")
 	overrides6 := flag.String("override6", "", "IPv6 override outgoing address (iface=addr)")
 	wildcard := flag.Bool("wildcard", false, "Bind to wildcard address instead of multicast group")
+	keepSourceFlag := flag.Bool("keep-source", false, "Keep original source IP (overrides -protocol)")
+	replaceSourceFlag := flag.Bool("replace-source", false, "Replace source IP with own (overrides -protocol)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	verbose := flag.Bool("v", false, "Verbose output (debug)")
 
@@ -589,6 +598,16 @@ func main() {
 		}
 	}
 
+	keepSource := preset.KeepSource
+	if *keepSourceFlag && *replaceSourceFlag {
+		log.Fatal("Cannot use both -keep-source and -replace-source")
+	}
+	if *keepSourceFlag {
+		keepSource = true
+	} else if *replaceSourceFlag {
+		keepSource = false
+	}
+
 	validateGroup := func(addr string, family IPFamily) {
 		ip := net.ParseIP(addr)
 		if ip == nil {
@@ -620,14 +639,14 @@ func main() {
 
 	var servers []*Server
 	if *ifaces4 != "" {
-		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard)
+		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource)
 		if err != nil {
 			log.Fatal(err)
 		}
 		servers = append(servers, s)
 	}
 	if *ifaces6 != "" {
-		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard)
+		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource)
 		if err != nil {
 			log.Fatal(err)
 		}
