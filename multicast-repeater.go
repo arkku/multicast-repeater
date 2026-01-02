@@ -24,7 +24,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"net"
 	"os"
@@ -38,7 +37,6 @@ import (
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
-	"golang.org/x/sys/unix"
 )
 
 // Version can be set at build time with -ldflags "-X main.Version=x.y.z"
@@ -55,6 +53,8 @@ func version() string {
 }
 
 const maxPacketSize = 9000
+const subnetReloadInterval = 5 * time.Second // Minimum interval between subnet reloads
+const maxExternalPrefixes = 256              // Die if we see more external prefixes (misconfiguration)
 
 type ProtocolPreset struct {
 	IPv4Group  string
@@ -128,85 +128,71 @@ func parseDirection(token string) (name string, dir Direction, err error) {
 type InterfaceConfig struct {
 	Interface *net.Interface
 	Addresses []net.IP
+	Subnets   []*net.IPNet // For validating source IPs are from this network
 	Override  net.IP
 	Direction Direction
 }
 
-// rawSender sends UDP packets with arbitrary source IPs using raw sockets.
-// This is needed for protocols like SSDP where unicast replies must reach
-// the original sender, not the repeater.
-type rawSender struct {
-	family  IPFamily
-	sockets map[int]int // ifIndex -> raw socket fd
+// ContainsIP returns true if the IP is within any of the interface's subnets.
+func (cfg *InterfaceConfig) ContainsIP(ip net.IP) bool {
+	for _, subnet := range cfg.Subnets {
+		if subnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
-func newRawSender(family IPFamily, ifaces map[int]*InterfaceConfig) (*rawSender, error) {
-	rs := &rawSender{
-		family:  family,
-		sockets: make(map[int]int),
+// ReloadSubnets refreshes the subnets from the interface's current addresses.
+func (cfg *InterfaceConfig) ReloadSubnets(family IPFamily) {
+	addrs, err := cfg.Interface.Addrs()
+	if err != nil {
+		return
 	}
-
-	for ifIndex, cfg := range ifaces {
-		if !cfg.Direction.Output {
+	var subnets []*net.IPNet
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok || !family.matches(ipnet.IP) {
 			continue
 		}
-
-		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
-		if family == IPv6 {
-			fd, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+		if family == IPv6 && !ipnet.IP.IsLinkLocalUnicast() {
+			continue
 		}
-		if err != nil {
-			rs.Close()
-			return nil, fmt.Errorf("create raw socket for %s: %w", cfg.Interface.Name, err)
-		}
-
-		if family == IPv4 {
-			if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
-				syscall.Close(fd)
-				rs.Close()
-				return nil, fmt.Errorf("set IP_HDRINCL for %s: %w", cfg.Interface.Name, err)
-			}
-		}
-
-		// Bind socket to specific interface (Linux-specific)
-		if err := unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, cfg.Interface.Name); err != nil {
-			syscall.Close(fd)
-			rs.Close()
-			return nil, fmt.Errorf("bind to %s: %w", cfg.Interface.Name, err)
-		}
-
-		rs.sockets[ifIndex] = fd
+		subnets = append(subnets, ipnet)
 	}
-
-	return rs, nil
+	cfg.Subnets = subnets
 }
 
-func (rs *rawSender) Close() {
-	for _, fd := range rs.sockets {
-		syscall.Close(fd)
+// ipToPrefix returns a prefix key for tracking unknown subnets.
+// Uses /24 for IPv4 and /64 for IPv6.
+func ipToPrefix(ip net.IP) [16]byte {
+	var key [16]byte
+	if v4 := ip.To4(); v4 != nil {
+		// IPv4: use /24 prefix (first 3 bytes), stored in IPv4-mapped position
+		key[10] = 0xff
+		key[11] = 0xff
+		key[12] = v4[0]
+		key[13] = v4[1]
+		key[14] = v4[2]
+		// key[15] = 0 (masked)
+	} else if v6 := ip.To16(); v6 != nil {
+		// IPv6: use /64 prefix (first 8 bytes)
+		copy(key[:8], v6[:8])
 	}
+	return key
 }
 
-func (rs *rawSender) Send(ifIndex int, srcIP, dstIP net.IP, srcPort, dstPort, ttl int, payload []byte) error {
-	fd, ok := rs.sockets[ifIndex]
-	if !ok {
-		return fmt.Errorf("no raw socket for interface %d", ifIndex)
+// prefixToIP converts a prefix key back to a representative IP for subnet matching.
+func prefixToIP(prefix [16]byte, family IPFamily) net.IP {
+	if family == IPv4 {
+		// IPv4 prefix is stored at bytes 12-14 (IPv4-mapped format)
+		return net.IPv4(prefix[12], prefix[13], prefix[14], 1)
 	}
-
-	var packet []byte
-	var sa syscall.Sockaddr
-
-	if rs.family == IPv4 {
-		packet = buildIPv4UDPPacket(srcIP, dstIP, uint16(srcPort), uint16(dstPort), uint8(ttl), payload)
-		sa = &syscall.SockaddrInet4{Port: 0}
-		copy(sa.(*syscall.SockaddrInet4).Addr[:], dstIP.To4())
-	} else {
-		packet = buildIPv6UDPPacket(srcIP, dstIP, uint16(srcPort), uint16(dstPort), uint8(ttl), payload)
-		sa = &syscall.SockaddrInet6{Port: 0}
-		copy(sa.(*syscall.SockaddrInet6).Addr[:], dstIP.To16())
-	}
-
-	return syscall.Sendto(fd, packet, 0, sa)
+	// IPv6: first 8 bytes are the /64 prefix
+	ip := make(net.IP, 16)
+	copy(ip[:8], prefix[:8])
+	ip[15] = 1 // Add a host part
+	return ip
 }
 
 func buildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, ttl uint8, payload []byte) []byte {
@@ -384,57 +370,6 @@ func udp6Checksum(srcIP, dstIP net.IP, udpPacket []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// packetCache tracks recently seen packets to prevent forwarding loops.
-// When keepSource is enabled, we can't identify our own packets by source IP,
-// so we hash the packet contents and ignore duplicates within a time window.
-
-const (
-	packetCacheMaxAge  = 2 * time.Second
-	packetCacheMaxSize = 1000
-)
-
-type packetCache struct {
-	seen map[uint64]time.Time
-}
-
-func newPacketCache() *packetCache {
-	return &packetCache{
-		seen: make(map[uint64]time.Time),
-	}
-}
-
-func (pc *packetCache) hash(srcIP net.IP, payload []byte) uint64 {
-	h := fnv.New64a()
-	h.Write(srcIP)
-	h.Write(payload)
-	return h.Sum64()
-}
-
-func (pc *packetCache) isDuplicate(srcIP net.IP, payload []byte) bool {
-	key := pc.hash(srcIP, payload)
-	now := time.Now()
-
-	// Check if we've seen this packet recently
-	if ts, ok := pc.seen[key]; ok && now.Sub(ts) < packetCacheMaxAge {
-		return true
-	}
-
-	// Add to cache
-	pc.seen[key] = now
-
-	// Periodic cleanup if cache is getting large
-	if len(pc.seen) > packetCacheMaxSize {
-		cutoff := now.Add(-packetCacheMaxAge)
-		for k, ts := range pc.seen {
-			if ts.Before(cutoff) {
-				delete(pc.seen, k)
-			}
-		}
-	}
-
-	return false
-}
-
 func parseInterfaceList(list string, family IPFamily, overrides map[string]string) (map[int]*InterfaceConfig, error) {
 	result := map[int]*InterfaceConfig{}
 	if list == "" {
@@ -467,11 +402,14 @@ func parseInterfaceList(list string, family IPFamily, overrides map[string]strin
 		}
 
 		var ips []net.IP
+		var subnets []*net.IPNet
 		for _, addr := range addrs {
 			var ip net.IP
+			var ipnet *net.IPNet
 			switch a := addr.(type) {
 			case *net.IPNet:
 				ip = a.IP
+				ipnet = a
 			case *net.IPAddr:
 				ip = a.IP
 			}
@@ -482,6 +420,9 @@ func parseInterfaceList(list string, family IPFamily, overrides map[string]strin
 				continue
 			}
 			ips = append(ips, ip)
+			if ipnet != nil {
+				subnets = append(subnets, ipnet)
+			}
 		}
 
 		if len(ips) == 0 {
@@ -505,6 +446,7 @@ func parseInterfaceList(list string, family IPFamily, overrides map[string]strin
 		result[ifaceObj.Index] = &InterfaceConfig{
 			Interface: ifaceObj,
 			Addresses: ips,
+			Subnets:   subnets,
 			Override:  overrideIP,
 			Direction: dir,
 		}
@@ -594,7 +536,7 @@ func (server *Server) configureListener() error {
 		Control: func(_, _ string, rawConn syscall.RawConn) error {
 			var controlError error
 			if err := rawConn.Control(func(fd uintptr) {
-				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 					controlError = fmt.Errorf("setsockopt SO_REUSEADDR: %w", err)
 					return
 				}
@@ -740,11 +682,10 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 		}
 	}
 
-	// Packet cache for loop prevention when keepSource is enabled
-	var pktCache *packetCache
-	if server.keepSource {
-		pktCache = newPacketCache()
-	}
+	// Track prefixes that we've tried reloading for but still don't match any interface.
+	// This prevents repeated reload attempts for routed/external traffic.
+	externalPrefixes := make(map[[16]byte]bool)
+	var lastSubnetReload time.Time
 
 	buf := make([]byte, maxPacketSize)
 	for {
@@ -762,23 +703,65 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 		}
 
 		srcUDP, _ := srcAddr.(*net.UDPAddr)
+		if srcUDP == nil {
+			continue
+		}
 
-		// Loop prevention
-		if pktCache != nil && srcUDP != nil {
-			// With keepSource, we can't identify our packets by source IP,
-			// so we use srcIP+payload hashing to detect duplicates.
-			if pktCache.isDuplicate(srcUDP.IP, buf[:n]) {
-				if server.verbose {
-					server.log("Ignoring duplicate packet on %s from %s", inCfg.Interface.Name, srcUDP.IP)
-				}
-				continue
-			}
-		} else if srcUDP != nil && ownSources[ipToKey(srcUDP.IP)] {
-			// Without keepSource, check if source is one of our own IPs.
+		// Loop prevention: ignore packets from our own source IPs.
+		if ownSources[ipToKey(srcUDP.IP)] {
 			if server.verbose {
 				server.log("Ignoring own packet on %s from %s", inCfg.Interface.Name, srcUDP.IP)
 			}
 			continue
+		}
+
+		// With keepSource, verify the source is on the interface's subnet,
+		// since we can't avoid looping by just checking against our own IP.
+		if server.keepSource && len(inCfg.Subnets) > 0 && !inCfg.ContainsIP(srcUDP.IP) {
+			prefix := ipToPrefix(srcUDP.IP)
+
+			// If we haven't seen this prefix, try reloading subnets (might be new, e.g., via IPv6 RA)
+			if !externalPrefixes[prefix] {
+				// Rate-limit just to be safe
+				now := time.Now()
+				if now.Sub(lastSubnetReload) >= subnetReloadInterval {
+					lastSubnetReload = now
+					inCfg.ReloadSubnets(server.family)
+
+					// Clean up externalPrefixes in case any now match (subnet may have changed)
+					for extPrefix := range externalPrefixes {
+						for _, subnet := range inCfg.Subnets {
+							if subnet.Contains(prefixToIP(extPrefix, server.family)) {
+								delete(externalPrefixes, extPrefix)
+								break
+							}
+						}
+					}
+				}
+
+				// Check again after (possible) reload
+				if inCfg.ContainsIP(srcUDP.IP) {
+					server.log("Discovered new subnet on %s containing %s", inCfg.Interface.Name, srcUDP.IP)
+					// Fall through to process the packet
+				} else {
+					// Mark as external so we don't reload again for this prefix
+					if len(externalPrefixes) >= maxExternalPrefixes {
+						errCh <- fmt.Errorf("too many external prefixes (%d); check firewall/routing", len(externalPrefixes))
+						return
+					}
+					externalPrefixes[prefix] = true
+					if server.verbose {
+						server.log("Ignoring off-subnet packet on %s from %s", inCfg.Interface.Name, srcUDP.IP)
+					}
+					continue
+				}
+			} else {
+				// Prefix is already marked external, just ignore
+				if server.verbose {
+					server.log("Ignoring off-subnet packet on %s from %s", inCfg.Interface.Name, srcUDP.IP)
+				}
+				continue
+			}
 		}
 
 		payload := append([]byte(nil), buf[:n]...)

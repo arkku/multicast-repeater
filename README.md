@@ -104,7 +104,12 @@ multicast-repeater -i lan-main,lan-iot=in,lan-admin -protocol ssdp
 
 Note that SSDP preserves the original source address to support unicast
 replies, so if you do want active discovery to work across VLANs, you need to
-route the unicast replies back (allow port UDP 1900 across VLANs).
+route the unicast replies back (allow port UDP 1900 across VLANs). This feature
+requires raw sockets and is only implemented for Linux. This also requires
+loop prevention to check that the source IP is on the subnet of the interface,
+since we can no longer simply check that it isn't our own IP address. This
+_tries_ to work across dynamic subnets (e.g., from IPv6 RA), but requires some
+basic assumptions like: don't route SSDP from the public internet into your LAN.
 
 (Some devices might intentionally reject packets from another subnet even if
 you repeat them correctly. There you might need something that proxies the
