@@ -64,6 +64,15 @@ replies can be routed to the original sender. This can be overridden with the
 flag `-replace-source` (but it will break active search across VLANs unless you
 run some other program on the repeater to handle that).
 
+When the source address is replaced by the repeater's own IP address (e.g., with
+mDNS or with `-replace-source`), loop prevention defaults to simply checking
+that the source IP of a packet is not our own IP (i.e., we don't repeat the same
+packet twice even if it somehow loops back to us). When the original source IP
+is kept, only packets on a subnet on the receiving interface are repeated. This
+mode can also be enabled separately with `-strict`. In this mode subnets are
+refreshed dynamically if packets from unknown subnets are seen, so please do not
+route the public internet into the repeater.
+
 You can verify the repeat is working with the `-v` option to add verbosity
 (prints a line for every repeated packet). The program does not fork, it is
 meant to be used as a systemd unit or similar.

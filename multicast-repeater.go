@@ -493,6 +493,7 @@ type Server struct {
 	verbose    bool
 	wildcard   bool
 	keepSource bool
+	strict     bool
 
 	conn        net.PacketConn
 	rawSender   *rawSender // used to send packets with unowned IPs
@@ -715,9 +716,10 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			continue
 		}
 
-		// With keepSource, verify the source is on the interface's subnet,
-		// since we can't avoid looping by just checking against our own IP.
-		if server.keepSource && !inCfg.ContainsIP(srcUDP.IP) {
+		// In strict mode, verify the source is on the interface's subnet.
+		// This is required for keepSource (can't check against own IP), but
+		// also useful to guard against another repeater on the same interfaces.
+		if server.strict && !inCfg.ContainsIP(srcUDP.IP) {
 			prefix := ipToPrefix(srcUDP.IP)
 
 			// If we haven't seen this prefix, try reloading subnets (might be new, e.g., via IPv6 RA)
@@ -798,7 +800,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	}
 }
 
-func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource bool) (*Server, error) {
+func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource, strict bool) (*Server, error) {
 	ifaces, err := parseInterfaceList(interfaceList, family, overrides)
 	if err != nil {
 		return nil, err
@@ -840,6 +842,7 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 		verbose:    verbose,
 		wildcard:   wildcard,
 		keepSource: keepSource,
+		strict:     strict,
 	}
 
 	if keepSource {
@@ -884,8 +887,9 @@ func main() {
 	overrides4 := flag.String("override4", "", "IPv4 override outgoing address (iface=addr)")
 	overrides6 := flag.String("override6", "", "IPv6 override outgoing address (iface=addr)")
 	wildcard := flag.Bool("wildcard", false, "Bind to wildcard address instead of multicast group")
-	keepSourceFlag := flag.Bool("keep-source", false, "Keep original source IP (overrides -protocol)")
+	keepSourceFlag := flag.Bool("keep-source", false, "Keep original source IP (overrides -protocol, implies -strict)")
 	replaceSourceFlag := flag.Bool("replace-source", false, "Replace source IP with own (overrides -protocol)")
+	strictFlag := flag.Bool("strict", false, "Only repeat packets from IPs on the interface's subnet")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	verbose := flag.Bool("v", false, "Verbose output (debug)")
 
@@ -954,6 +958,9 @@ func main() {
 		keepSource = false
 	}
 
+	// -keep-source implies -strict (required for loop prevention with raw sockets)
+	strict := *strictFlag || keepSource
+
 	validateGroup := func(addr string, family IPFamily) {
 		ip := net.ParseIP(addr)
 		if ip == nil {
@@ -985,14 +992,14 @@ func main() {
 
 	var servers []*Server
 	if *ifaces4 != "" {
-		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource)
+		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource, strict)
 		if err != nil {
 			log.Fatal(err)
 		}
 		servers = append(servers, s)
 	}
 	if *ifaces6 != "" {
-		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource)
+		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource, strict)
 		if err != nil {
 			log.Fatal(err)
 		}
