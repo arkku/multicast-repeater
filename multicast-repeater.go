@@ -598,7 +598,19 @@ func (server *Server) configureListener() error {
 			return n, ifIndex, dst, src, ttl, nil
 		}
 
+		lastTTL := -1
 		server.writePacket = func(b []byte, outIf int, srcIP net.IP, dst *net.UDPAddr, ttl int) error {
+			// Must set multicast TTL on socket; control message TTL doesn't work for multicast
+			if ttl != lastTTL {
+				if err := packetConn.SetMulticastTTL(ttl); err != nil {
+					if lastTTL == -1 {
+						return fmt.Errorf("SetMulticastTTL: %w", err)
+					}
+					// Non-fatal if it worked before
+				} else {
+					lastTTL = ttl
+				}
+			}
 			cm := &ipv4.ControlMessage{
 				IfIndex: outIf,
 				Src:     srcIP,
@@ -649,7 +661,19 @@ func (server *Server) configureListener() error {
 			return n, ifIndex, dst, src, hopLimit, nil
 		}
 
+		lastHopLimit := -1
 		server.writePacket = func(b []byte, outIf int, srcIP net.IP, dst *net.UDPAddr, hopLimit int) error {
+			// Must set multicast hop limit on socket; control message doesn't work for multicast
+			if hopLimit != lastHopLimit {
+				if err := packetConn.SetMulticastHopLimit(hopLimit); err != nil {
+					if lastHopLimit == -1 {
+						return fmt.Errorf("SetMulticastHopLimit: %w", err)
+					}
+					// Non-fatal if it worked before
+				} else {
+					lastHopLimit = hopLimit
+				}
+			}
 			cm := &ipv6.ControlMessage{
 				IfIndex:  outIf,
 				Src:      srcIP,
@@ -787,15 +811,17 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			// Use raw sender when keepSource is enabled (to support non-owned source IPs)
 			useRaw := server.rawSender != nil && srcUDP != nil
 
-			if server.verbose {
-				server.log("Repeating from %s %s to %s (%d bytes)",
-					inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, len(payload))
-			}
-
 			// Use configured TTL if set, otherwise preserve incoming
 			outTTL := ttlOrHop
 			if server.ttl > 0 {
 				outTTL = server.ttl
+			} else if outTTL <= 0 {
+				outTTL = 255
+			}
+
+			if server.verbose {
+				server.log("Repeating from %s %s to %s (%d bytes, TTL %d)",
+					inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, len(payload), outTTL)
 			}
 
 			var err error
