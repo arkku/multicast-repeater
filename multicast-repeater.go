@@ -61,15 +61,16 @@ type ProtocolPreset struct {
 	IPv6Group  string
 	Port       int
 	KeepSource bool // true for protocols with unicast replies to source IP
+	TTL        int  // 0 = try to preserve incoming, >0 = force this value
 }
 
 var protocolPresets = map[string]ProtocolPreset{
-	"mdns":         {"224.0.0.251", "ff02::fb", 5353, false},
-	"ssdp":         {"239.255.255.250", "ff02::c", 1900, true},
-	"ws-discovery": {"239.255.255.250", "ff02::c", 3702, true},
-	"llmnr":        {"224.0.0.252", "ff02::1:3", 5355, true},
-	"coap":         {"224.0.1.187", "ff02::fd", 5683, true},
-	"slp":          {"239.255.255.253", "ff02::116", 427, true},
+	"mdns":         {"224.0.0.251", "ff02::fb", 5353, false, 255},
+	"ssdp":         {"239.255.255.250", "ff02::c", 1900, true, 0},
+	"ws-discovery": {"239.255.255.250", "ff02::c", 3702, true, 0},
+	"llmnr":        {"224.0.0.252", "ff02::1:3", 5355, true, 255},
+	"coap":         {"224.0.1.187", "ff02::fd", 5683, true, 0},
+	"slp":          {"239.255.255.253", "ff02::116", 427, true, 0},
 }
 
 var defaultPreset = protocolPresets["mdns"]
@@ -494,6 +495,7 @@ type Server struct {
 	wildcard   bool
 	keepSource bool
 	strict     bool
+	ttl        int // 0 = preserve incoming, >0 = force this value
 
 	conn        net.PacketConn
 	rawSender   *rawSender // used to send packets with unowned IPs
@@ -563,6 +565,11 @@ func (server *Server) configureListener() error {
 		if err := packetConn.SetMulticastLoopback(false); err != nil {
 			server.log("SetMulticastLoopback(false) failed: %v", err)
 		}
+		if server.ttl > 0 {
+			if err := packetConn.SetMulticastTTL(server.ttl); err != nil {
+				server.log("SetMulticastTTL(%d) failed: %v", server.ttl, err)
+			}
+		}
 
 		for _, cfg := range server.ifaces {
 			if !cfg.Direction.Input {
@@ -608,6 +615,11 @@ func (server *Server) configureListener() error {
 		}
 		if err := packetConn.SetMulticastLoopback(false); err != nil {
 			server.log("SetMulticastLoopback(false) failed: %v", err)
+		}
+		if server.ttl > 0 {
+			if err := packetConn.SetMulticastHopLimit(server.ttl); err != nil {
+				server.log("SetMulticastHopLimit(%d) failed: %v", server.ttl, err)
+			}
 		}
 
 		for _, cfg := range server.ifaces {
@@ -780,17 +792,23 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 					inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, len(payload))
 			}
 
+			// Use configured TTL if set, otherwise preserve incoming
+			outTTL := ttlOrHop
+			if server.ttl > 0 {
+				outTTL = server.ttl
+			}
+
 			var err error
 			if useRaw {
 				srcIP := srcUDP.IP
 				if outCfg.Override != nil {
 					srcIP = outCfg.Override
 				}
-				err = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, ttlOrHop, payload)
+				err = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
 			} else {
 				outSrcIP := sourceByInterface[outIfIndex]
 				dst := &net.UDPAddr{IP: server.group, Port: server.port}
-				err = server.writePacket(payload, outIfIndex, outSrcIP, dst, ttlOrHop)
+				err = server.writePacket(payload, outIfIndex, outSrcIP, dst, outTTL)
 			}
 			if err != nil {
 				errCh <- fmt.Errorf("write to %s: %w", outCfg.Interface.Name, err)
@@ -800,7 +818,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	}
 }
 
-func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource, strict bool) (*Server, error) {
+func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource, strict bool, ttl int) (*Server, error) {
 	ifaces, err := parseInterfaceList(interfaceList, family, overrides)
 	if err != nil {
 		return nil, err
@@ -843,6 +861,7 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 		wildcard:   wildcard,
 		keepSource: keepSource,
 		strict:     strict,
+		ttl:        ttl,
 	}
 
 	if keepSource {
@@ -890,6 +909,7 @@ func main() {
 	keepSourceFlag := flag.Bool("keep-source", false, "Keep original source IP (overrides -protocol, implies -strict)")
 	replaceSourceFlag := flag.Bool("replace-source", false, "Replace source IP with own (overrides -protocol)")
 	strictFlag := flag.Bool("strict", false, "Only repeat packets from IPs on the interface's subnet")
+	ttlFlag := flag.Int("ttl", -1, "Multicast TTL (0=preserve incoming, >0=force value, -1=protocol default)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	verbose := flag.Bool("v", false, "Verbose output (debug)")
 
@@ -961,6 +981,12 @@ func main() {
 	// -keep-source implies -strict (required for loop prevention with raw sockets)
 	strict := *strictFlag || keepSource
 
+	// TTL: -1 = use protocol default, 0 = preserve incoming, >0 = force value
+	ttl := preset.TTL
+	if *ttlFlag >= 0 {
+		ttl = *ttlFlag
+	}
+
 	validateGroup := func(addr string, family IPFamily) {
 		ip := net.ParseIP(addr)
 		if ip == nil {
@@ -992,14 +1018,14 @@ func main() {
 
 	var servers []*Server
 	if *ifaces4 != "" {
-		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource, strict)
+		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource, strict, ttl)
 		if err != nil {
 			log.Fatal(err)
 		}
 		servers = append(servers, s)
 	}
 	if *ifaces6 != "" {
-		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource, strict)
+		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource, strict, ttl)
 		if err != nil {
 			log.Fatal(err)
 		}
