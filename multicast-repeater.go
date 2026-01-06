@@ -1055,13 +1055,21 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			outSrcIP := sourceByInterface[outIfIndex]
 
 			if isProxyPacket && server.rawSender != nil {
-				// Proxy M-SEARCH: use raw socket with proxy port as source
-				// so responses come back to our proxy listener
+				// Proxy M-SEARCH: send with our IP:proxyPort so responses come to our proxy listener
 				proxyListenPort := server.proxyPort
 				if proxyListenPort == 0 {
 					proxyListenPort = server.port
 				}
 				err = server.rawSender.Send(outIfIndex, outSrcIP, server.group, proxyListenPort, server.port, outTTL, payload)
+				if err == nil && server.keepSource {
+					// Also send with original source IP - some devices may respond directly
+					// to the requester if they don't check source subnet
+					srcIP := srcUDP.IP
+					if outCfg.Override != nil {
+						srcIP = outCfg.Override
+					}
+					_ = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
+				}
 			} else if server.rawSender != nil && srcUDP != nil && server.keepSource {
 				// keepSource mode: use raw socket with original source IP
 				srcIP := srcUDP.IP
@@ -1264,10 +1272,10 @@ func main() {
 	proxyTimeout := time.Duration(*proxyTimeFlag) * time.Second
 	if *proxyFlag != "" {
 		if *keepSourceFlag {
-			log.Fatal("Cannot use -proxy with -keep-source (proxy requires source replacement)")
+			log.Fatal("Cannot use -proxy with -keep-source (proxy replaces source for proxyable packets only)")
 		}
-		// Proxy mode requires source replacement (overrides protocol preset)
-		keepSource = false
+		// Note: keepSource from preset is preserved - proxy mode only replaces
+		// source for detected proxyable packets (e.g., M-SEARCH), not all packets
 		var ok bool
 		proxyRecognizer, ok = proxyModes[*proxyFlag]
 		if !ok {
