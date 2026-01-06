@@ -797,8 +797,17 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			}
 			proxyRequesters = validRequesters
 
-			// Forward to all recent requesters using raw socket to preserve source IP
+			// Forward to requesters on different subnets (same subnet can communicate directly)
 			for _, r := range proxyRequesters {
+				// Skip if requester and responder are on the same subnet
+				// (they can communicate directly without proxying)
+				reqCfg := server.ifaces[r.ifIndex]
+				if reqCfg != nil && reqCfg.ContainsIP(srcAddr.IP) {
+					if server.verbose {
+						server.log("Proxy skipping %s (same subnet as %s)", r.addr, srcAddr.IP)
+					}
+					continue
+				}
 				err := server.rawSender.Send(r.ifIndex, srcAddr.IP, r.addr.IP, srcAddr.Port, r.addr.Port, 255, respBuf[:n])
 				if err != nil {
 					if server.verbose {
