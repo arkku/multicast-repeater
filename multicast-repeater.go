@@ -555,6 +555,7 @@ func (server *Server) configureListener() error {
 		return fmt.Errorf("listen %s %s: %w", network, listenAddress, err)
 	}
 	server.conn = conn
+	server.log("Listening on %s", listenAddress)
 
 	if server.family == IPv4 {
 		packetConn := ipv4.NewPacketConn(conn)
@@ -708,14 +709,14 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	ownSources := make(map[[16]byte]bool)
 
 	for ifIndex, cfg := range server.ifaces {
-		if !cfg.Direction.Output {
-			continue
+		if cfg.Direction.Input {
+			server.log("Input from %s (%s)", cfg.Interface.Name, cfg.SourceAddress())
 		}
-		srcIP := cfg.SourceAddress()
-		sourceByInterface[ifIndex] = srcIP
-		ownSources[ipToKey(srcIP)] = true
-		if server.verbose {
-			server.log("Output %s via %s", cfg.Interface.Name, srcIP)
+		if cfg.Direction.Output {
+			srcIP := cfg.SourceAddress()
+			sourceByInterface[ifIndex] = srcIP
+			ownSources[ipToKey(srcIP)] = true
+			server.log("Output to %s via %s", cfg.Interface.Name, srcIP)
 		}
 	}
 
