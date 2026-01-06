@@ -129,11 +129,15 @@ replies, which this program doesn't.)
 It seems that some SSDP implementations do not reply to `M-SEARCH` across
 subnets, even if they see the packet. There is an experimental `-proxy ssdp`
 argument to instead rewrite the source address of packets and then proxy the
-unicast replies back to the querier. This still won't help if the device
-itself refuses even unicast from another subnet.
+unicast replies back to the querier. By default the proxy unicast replies are
+listened on the same port as the multicast (e.g., port 1900 in case of SSDP),
+but can be configured with `-proxy-port 1902` or whatever to avoid conflicting
+with something else listening to unicast on the same port. (Note that such
+conflicts may silently cause incorrect behavior!)
 
-There is a potential hack around that that may or may not work for a pair of
-adjacent IPv4 subnets:
+This still won't help if the device itself refuses even unicast from another
+subnet. There is a potential hack around that that may or may not work for a
+pair of adjacent IPv4 subnets (without needing the proxy):
 
 * subnet A: 192.168.0.0/24
 * subnet B: 192.168.1.0/24
