@@ -123,3 +123,25 @@ basic assumptions like: don't route SSDP from the public internet into your LAN.
 (Some devices might intentionally reject packets from another subnet even if
 you repeat them correctly. There you might need something that proxies the
 replies, which this program doesn't.)
+
+#### Unicast proxy
+
+It seems that some SSDP implementations do not reply to `M-SEARCH` across
+subnets, even if they see the packet. There is an experimental `-proxy ssdp`
+argument to instead rewrite the source address of packets and then proxy the
+unicast replies back to the querier. This still won't help if the device
+itself refuses even unicast from another subnet.
+
+There is a potential hack around that that may or may not work for a pair of
+adjacent IPv4 subnets:
+
+* subnet A: 192.168.0.0/24
+* subnet B: 192.168.1.0/24
+
+With the troublesome devices in subnet B, configure them to believe they are
+in subnet 192.168.0.0/23 instead (this covers exactly the two actual subnets
+and has the same broadcast address, 192.168.1.255, as subnet B). Then enable
+proxy ARP on the router on the subnet B interface. This is a terrible hack,
+if all else fails it may be worth trying intead of giving up on separate VLANs.
+The hack all the problematic devices to be only on the subnet B side, and the
+two subnets differ only by one bit and be in this order.

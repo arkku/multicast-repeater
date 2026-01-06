@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -486,16 +487,18 @@ func (cfg *InterfaceConfig) SourceAddress() net.IP {
 }
 
 type Server struct {
-	prefix     string
-	family     IPFamily
-	group      net.IP
-	port       int
-	ifaces     map[int]*InterfaceConfig
-	verbose    bool
-	wildcard   bool
-	keepSource bool
-	strict     bool
-	ttl        int // 0 = preserve incoming, >0 = force this value
+	prefix          string
+	family          IPFamily
+	group           net.IP
+	port            int
+	ifaces          map[int]*InterfaceConfig
+	verbose         bool
+	wildcard        bool
+	keepSource      bool
+	strict          bool
+	ttl             int                   // 0 = preserve incoming, >0 = force this value
+	proxyRecognizer ProxyPacketRecognizer // nil = disabled, function to detect proxyable packets
+	proxyTimeout    time.Duration         // how long to keep proxying responses after a request
 
 	conn        net.PacketConn
 	rawSender   *rawSender // used to send packets with unowned IPs
@@ -702,6 +705,33 @@ func ipToKey(ip net.IP) [16]byte {
 	return key
 }
 
+// ProxyPacketRecognizer determines if a packet should be proxied (response forwarded to sender).
+type ProxyPacketRecognizer func(payload []byte) bool
+
+// proxyModes maps proxy mode names to their packet recognizers.
+var proxyModes = map[string]ProxyPacketRecognizer{
+	"ssdp": func(payload []byte) bool {
+		// SSDP M-SEARCH requests trigger unicast responses
+		return len(payload) >= 8 && string(payload[:8]) == "M-SEARCH"
+	},
+}
+
+func knownProxyModes() string {
+	names := make([]string, 0, len(proxyModes))
+	for name := range proxyModes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// proxyRequester tracks a client that sent a proxyable packet.
+type proxyRequester struct {
+	addr    *net.UDPAddr
+	ifIndex int // interface the request came in on (for sending responses)
+	time    time.Time
+}
+
 func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	defer wg.Done()
 
@@ -724,6 +754,70 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	// This prevents repeated reload attempts for routed/external traffic.
 	externalPrefixes := make(map[[16]byte]bool)
 	var lastSubnetReload time.Time
+
+	// SSDP proxy mode: track M-SEARCH requesters and forward unicast responses
+	var proxyRequesters []proxyRequester
+	var proxyMu sync.Mutex
+	var proxyConn *net.UDPConn
+
+	if server.proxyRecognizer != nil {
+		// Listen for unicast responses on the SSDP port
+		var listenAddr string
+		if server.family == IPv4 {
+			listenAddr = fmt.Sprintf(":%d", server.port)
+		} else {
+			listenAddr = fmt.Sprintf("[::]:%d", server.port)
+		}
+		addr, err := net.ResolveUDPAddr("udp", listenAddr)
+		if err != nil {
+			errCh <- fmt.Errorf("resolve proxy listen address: %w", err)
+			return
+		}
+		proxyConn, err = net.ListenUDP("udp", addr)
+		if err != nil {
+			errCh <- fmt.Errorf("proxy listener on port %d: %w", server.port, err)
+			return
+		}
+		{
+			server.log("Proxy listening for unicast responses on %s", listenAddr)
+			defer proxyConn.Close()
+
+			// Goroutine to handle unicast responses
+			go func() {
+				respBuf := make([]byte, maxPacketSize)
+				for {
+					n, srcAddr, err := proxyConn.ReadFromUDP(respBuf)
+					if err != nil {
+						return // Connection closed
+					}
+
+					// Clean up old requesters and forward to recent ones
+					proxyMu.Lock()
+					now := time.Now()
+					var validRequesters []proxyRequester
+					for _, r := range proxyRequesters {
+						if now.Sub(r.time) < server.proxyTimeout {
+							validRequesters = append(validRequesters, r)
+						}
+					}
+					proxyRequesters = validRequesters
+
+					// Forward to all recent requesters using raw socket to preserve source IP
+					for _, r := range proxyRequesters {
+						err := server.rawSender.Send(r.ifIndex, srcAddr.IP, r.addr.IP, srcAddr.Port, r.addr.Port, 255, respBuf[:n])
+						if err != nil {
+							if server.verbose {
+								server.log("Proxy forward to %s failed: %v", r.addr, err)
+							}
+						} else if server.verbose {
+							server.log("Proxy forwarded response from %s to %s (%d bytes)", srcAddr, r.addr, n)
+						}
+					}
+					proxyMu.Unlock()
+				}
+			}()
+		}
+	}
 
 	buf := make([]byte, maxPacketSize)
 	for {
@@ -804,13 +898,41 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 		}
 
 		payload := append([]byte(nil), buf[:n]...)
+
+		// Proxy mode: detect proxyable packets and track the requester
+		isProxyPacket := server.proxyRecognizer != nil && server.proxyRecognizer(payload)
+		if isProxyPacket {
+			proxyMu.Lock()
+			// Add this requester (dedup by address)
+			found := false
+			for i, r := range proxyRequesters {
+				if r.addr.IP.Equal(srcUDP.IP) && r.addr.Port == srcUDP.Port {
+					proxyRequesters[i].time = time.Now()
+					found = true
+					break
+				}
+			}
+			if !found {
+				proxyRequesters = append(proxyRequesters, proxyRequester{
+					addr:    &net.UDPAddr{IP: srcUDP.IP, Port: srcUDP.Port},
+					ifIndex: inIfIndex,
+					time:    time.Now(),
+				})
+				if server.verbose {
+					server.log("Proxy tracking request from %s", srcUDP)
+				}
+			}
+			proxyMu.Unlock()
+		}
+
 		for outIfIndex, outCfg := range server.ifaces {
 			if outIfIndex == inIfIndex || !outCfg.Direction.Output {
 				continue
 			}
 
-			// Use raw sender when keepSource is enabled (to support non-owned source IPs)
-			useRaw := server.rawSender != nil && srcUDP != nil
+			// Use raw sender when keepSource is enabled, but NOT for proxy M-SEARCH
+			// (proxy M-SEARCH uses local source so devices respond to us)
+			useRaw := server.rawSender != nil && srcUDP != nil && !isProxyPacket
 
 			// Use configured TTL if set, otherwise preserve incoming
 			outTTL := ttlOrHop
@@ -821,8 +943,12 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			}
 
 			if server.verbose {
-				server.log("Repeating from %s %s to %s (%d bytes, TTL %d)",
-					inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, len(payload), outTTL)
+				extra := ""
+				if isProxyPacket {
+					extra = ", proxy"
+				}
+				server.log("Repeating from %s %s to %s (%d bytes, TTL %d%s)",
+					inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, len(payload), outTTL, extra)
 			}
 
 			var err error
@@ -845,7 +971,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	}
 }
 
-func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource, strict bool, ttl int) (*Server, error) {
+func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource, strict bool, ttl int, proxyRecognizer ProxyPacketRecognizer, proxyTimeout time.Duration) (*Server, error) {
 	ifaces, err := parseInterfaceList(interfaceList, family, overrides)
 	if err != nil {
 		return nil, err
@@ -879,20 +1005,24 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 	}
 
 	s := &Server{
-		prefix:     family.String(),
-		family:     family,
-		group:      groupIP,
-		port:       port,
-		ifaces:     ifaces,
-		verbose:    verbose,
-		wildcard:   wildcard,
-		keepSource: keepSource,
-		strict:     strict,
-		ttl:        ttl,
+		prefix:          family.String(),
+		family:          family,
+		group:           groupIP,
+		port:            port,
+		ifaces:          ifaces,
+		verbose:         verbose,
+		wildcard:        wildcard,
+		keepSource:      keepSource,
+		strict:          strict,
+		ttl:             ttl,
+		proxyRecognizer: proxyRecognizer,
+		proxyTimeout:    proxyTimeout,
 	}
 
-	if keepSource {
-		rs, err := newRawSender(family, ifaces)
+	if keepSource || proxyRecognizer != nil {
+		// For keepSource, we need raw sockets on output interfaces.
+		// For proxy mode, we also need them on input interfaces (to send responses back).
+		rs, err := newRawSender(family, ifaces, proxyRecognizer != nil)
 		if err != nil {
 			return nil, fmt.Errorf("raw sender: %w", err)
 		}
@@ -937,6 +1067,8 @@ func main() {
 	replaceSourceFlag := flag.Bool("replace-source", false, "Replace source IP with own (overrides -protocol)")
 	strictFlag := flag.Bool("strict", false, "Only repeat packets from IPs on the interface's subnet")
 	ttlFlag := flag.Int("ttl", -1, "Multicast TTL (0=preserve incoming, >0=force value, -1=protocol default)")
+	proxyFlag := flag.String("proxy", "", "Proxy mode for unicast responses: ssdp")
+	proxyTimeFlag := flag.Int("proxy-time", 3, "Seconds to keep proxying responses after a request")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	verbose := flag.Bool("v", false, "Verbose output (debug)")
 
@@ -1014,6 +1146,20 @@ func main() {
 		ttl = *ttlFlag
 	}
 
+	// Proxy mode validation
+	var proxyRecognizer ProxyPacketRecognizer
+	proxyTimeout := time.Duration(*proxyTimeFlag) * time.Second
+	if *proxyFlag != "" {
+		if keepSource {
+			log.Fatal("Cannot use -proxy with -keep-source (proxy requires source replacement)")
+		}
+		var ok bool
+		proxyRecognizer, ok = proxyModes[*proxyFlag]
+		if !ok {
+			log.Fatalf("Unsupported proxy mode %q (supported: %s)", *proxyFlag, knownProxyModes())
+		}
+	}
+
 	validateGroup := func(addr string, family IPFamily) {
 		ip := net.ParseIP(addr)
 		if ip == nil {
@@ -1045,14 +1191,14 @@ func main() {
 
 	var servers []*Server
 	if *ifaces4 != "" {
-		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource, strict, ttl)
+		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource, strict, ttl, proxyRecognizer, proxyTimeout)
 		if err != nil {
 			log.Fatal(err)
 		}
 		servers = append(servers, s)
 	}
 	if *ifaces6 != "" {
-		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource, strict, ttl)
+		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource, strict, ttl, proxyRecognizer, proxyTimeout)
 		if err != nil {
 			log.Fatal(err)
 		}

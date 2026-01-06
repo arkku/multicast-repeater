@@ -18,14 +18,15 @@ type rawSender struct {
 	sockets map[int]int // ifIndex -> raw socket fd
 }
 
-func newRawSender(family IPFamily, ifaces map[int]*InterfaceConfig) (*rawSender, error) {
+func newRawSender(family IPFamily, ifaces map[int]*InterfaceConfig, includeInput bool) (*rawSender, error) {
 	rs := &rawSender{
 		family:  family,
 		sockets: make(map[int]int),
 	}
 
 	for ifIndex, cfg := range ifaces {
-		if !cfg.Direction.Output {
+		// Output interfaces for keepSource mode, input interfaces for proxy mode (responses)
+		if !cfg.Direction.Output && !(includeInput && cfg.Direction.Input) {
 			continue
 		}
 
