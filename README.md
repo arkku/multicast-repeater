@@ -131,9 +131,13 @@ subnets, even if they see the packet. There is an experimental `-proxy ssdp`
 argument to instead rewrite the source address of packets and then proxy the
 unicast replies back to the querier. By default the proxy unicast replies are
 listened on the same port as the multicast (e.g., port 1900 in case of SSDP),
-but can be configured with `-proxy-port 1902` or whatever to avoid conflicting
+but can be configured with `-proxy-port 1901` or whatever to avoid conflicting
 with something else listening to unicast on the same port. (Note that such
 conflicts may silently cause incorrect behavior!)
+
+You can enable proxy only for specific IP families with `-proxy4 ssdp` or
+`-proxy6 ssdp`, e.g., if you find that IPv4 works without proxying but IPv6
+needs it due to link-local addresses.
 
 This still won't help if the device itself refuses even unicast from another
 subnet. There is a potential hack around that that may or may not work for a

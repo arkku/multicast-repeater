@@ -58,20 +58,21 @@ const subnetReloadInterval = 5 * time.Second // Minimum interval between subnet 
 const maxExternalPrefixes = 256              // Die if we see more external prefixes (misconfiguration)
 
 type ProtocolPreset struct {
-	IPv4Group  string
-	IPv6Group  string
-	Port       int
-	KeepSource bool // true for protocols with unicast replies to source IP
-	TTL        int  // 0 = try to preserve incoming, >0 = force this value
+	IPv4Group   string
+	IPv6Group   string
+	Port        int
+	KeepSource  bool   // true for protocols with unicast replies to source IP
+	TTL         int    // 0 = try to preserve incoming, >0 = force this value
+	SkipUnicast string // recognizer name for packets to skip when not proxying (e.g., "ssdp")
 }
 
 var protocolPresets = map[string]ProtocolPreset{
-	"mdns":         {"224.0.0.251", "ff02::fb", 5353, false, 255},
-	"ssdp":         {"239.255.255.250", "ff02::c", 1900, true, 0},
-	"ws-discovery": {"239.255.255.250", "ff02::c", 3702, true, 0},
-	"llmnr":        {"224.0.0.252", "ff02::1:3", 5355, true, 255},
-	"coap":         {"224.0.1.187", "ff02::fd", 5683, true, 0},
-	"slp":          {"239.255.255.253", "ff02::116", 427, true, 0},
+	"mdns":         {"224.0.0.251", "ff02::fb", 5353, false, 255, ""},
+	"ssdp":         {"239.255.255.250", "ff02::c", 1900, true, 0, "ssdp"},
+	"ws-discovery": {"239.255.255.250", "ff02::c", 3702, true, 0, "ssdp"},
+	"llmnr":        {"224.0.0.252", "ff02::1:3", 5355, true, 255, ""},
+	"coap":         {"224.0.1.187", "ff02::fd", 5683, true, 0, ""},
+	"slp":          {"239.255.255.253", "ff02::116", 427, true, 0, ""},
 }
 
 var defaultPreset = protocolPresets["mdns"]
@@ -500,6 +501,7 @@ type Server struct {
 	proxyRecognizer ProxyPacketRecognizer // nil = disabled, function to detect proxyable packets
 	proxyTimeout    time.Duration         // how long to keep proxying responses after a request
 	proxyPort       int                   // port for proxy listener (0 = same as main port)
+	skipUnicast     ProxyPacketRecognizer // skip unicast-expecting packets when proxy not enabled
 
 	conn        net.PacketConn
 	rawSender   *rawSender // used to send packets with unowned IPs
@@ -709,12 +711,14 @@ func ipToKey(ip net.IP) [16]byte {
 // ProxyPacketRecognizer determines if a packet should be proxied (response forwarded to sender).
 type ProxyPacketRecognizer func(payload []byte) bool
 
+// isSSDPMSearch checks if a packet is an SSDP M-SEARCH request.
+func isSSDPMSearch(payload []byte) bool {
+	return len(payload) >= 8 && string(payload[:8]) == "M-SEARCH"
+}
+
 // proxyModes maps proxy mode names to their packet recognizers.
 var proxyModes = map[string]ProxyPacketRecognizer{
-	"ssdp": func(payload []byte) bool {
-		// SSDP M-SEARCH requests trigger unicast responses
-		return len(payload) >= 8 && string(payload[:8]) == "M-SEARCH"
-	},
+	"ssdp": isSSDPMSearch,
 }
 
 func knownProxyModes() string {
@@ -759,7 +763,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	// SSDP proxy mode: track M-SEARCH requesters and forward unicast responses
 	var proxyRequesters []proxyRequester
 	var proxyMu sync.Mutex
-	var proxyConns []*net.UDPConn
+	proxyConnsByIface := make(map[int]*net.UDPConn)
 
 	if server.proxyRecognizer != nil {
 		// Listen for unicast responses on the proxy port
@@ -808,7 +812,22 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 					}
 					continue
 				}
-				err := server.rawSender.Send(r.ifIndex, srcAddr.IP, r.addr.IP, srcAddr.Port, r.addr.Port, 255, respBuf[:n])
+
+				// Determine how to forward the response
+				var err error
+				if server.rawSender != nil && server.family == IPv4 {
+					// IPv4: use raw socket to preserve original source IP
+					err = server.rawSender.Send(r.ifIndex, srcAddr.IP, r.addr.IP, srcAddr.Port, r.addr.Port, 255, respBuf[:n])
+				} else {
+					// IPv6: use the proxy connection for the requester's interface
+					// Source will be our proxy listener address (link-local addresses don't work cross-subnet anyway)
+					if conn, ok := proxyConnsByIface[r.ifIndex]; ok {
+						_, err = conn.WriteToUDP(respBuf[:n], r.addr)
+					} else {
+						err = fmt.Errorf("no proxy connection for interface %d", r.ifIndex)
+					}
+				}
+
 				if err != nil {
 					if server.verbose {
 						server.log("Proxy forward to %s failed: %v", r.addr, err)
@@ -865,7 +884,11 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				return
 			}
 			proxyConn := conn.(*net.UDPConn)
-			proxyConns = append(proxyConns, proxyConn)
+			// In wildcard mode, use interface index 0 as a placeholder
+			// (responses will be sent from the appropriate interface by kernel routing)
+			for ifIndex := range sourceByInterface {
+				proxyConnsByIface[ifIndex] = proxyConn
+			}
 			server.log("Proxy listening for unicast responses on %s", listenAddr)
 			startProxyListener(proxyConn)
 		} else {
@@ -903,22 +926,26 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				conn, err := proxyListenConfig.ListenPacket(context.Background(), network, listenAddr)
 				if err != nil {
 					// Close any already-opened connections
-					for _, c := range proxyConns {
+					for _, c := range proxyConnsByIface {
 						c.Close()
 					}
 					errCh <- fmt.Errorf("proxy listener on %s (interface %d): %w", listenAddr, ifIndex, err)
 					return
 				}
 				proxyConn := conn.(*net.UDPConn)
-				proxyConns = append(proxyConns, proxyConn)
+				proxyConnsByIface[ifIndex] = proxyConn
 				server.log("Proxy listening for unicast responses on %s", listenAddr)
 				startProxyListener(proxyConn)
 			}
 		}
 		// Defer cleanup of all proxy connections
 		defer func() {
-			for _, c := range proxyConns {
-				c.Close()
+			closed := make(map[*net.UDPConn]bool)
+			for _, c := range proxyConnsByIface {
+				if !closed[c] {
+					c.Close()
+					closed[c] = true
+				}
 			}
 		}()
 	}
@@ -1003,8 +1030,19 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 
 		payload := append([]byte(nil), buf[:n]...)
 
-		// Proxy mode: detect proxyable packets and track the requester
+		// Proxy mode: detect proxyable packets that expect unicast replies
 		isProxyPacket := server.proxyRecognizer != nil && server.proxyRecognizer(payload)
+
+		// Skip packets that expect unicast replies when proxy is not enabled.
+		// These would result in responses going to our IP but not being forwarded.
+		if server.skipUnicast != nil && server.skipUnicast(payload) && !isProxyPacket {
+			if server.verbose {
+				server.log("Skipping unicast-expecting packet on %s from %s (no proxy)",
+					inCfg.Interface.Name, srcAddr)
+			}
+			continue
+		}
+
 		if isProxyPacket {
 			proxyMu.Lock()
 			// Add this requester (dedup by address)
@@ -1054,23 +1092,28 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			var err error
 			outSrcIP := sourceByInterface[outIfIndex]
 
-			if isProxyPacket && server.rawSender != nil {
+			// Note: Raw sockets for IPv6 don't support IP_HDRINCL on Linux,
+			// so we can't spoof source IPs. Fall back to regular socket for IPv6.
+			useRawSender := server.rawSender != nil && server.family == IPv4
+
+			if isProxyPacket && useRawSender {
 				// Proxy M-SEARCH: send with our IP:proxyPort so responses come to our proxy listener
 				proxyListenPort := server.proxyPort
 				if proxyListenPort == 0 {
 					proxyListenPort = server.port
 				}
 				err = server.rawSender.Send(outIfIndex, outSrcIP, server.group, proxyListenPort, server.port, outTTL, payload)
-				if err == nil && server.keepSource {
+				if err == nil && server.keepSource && server.skipUnicast == nil {
 					// Also send with original source IP - some devices may respond directly
-					// to the requester if they don't check source subnet
+					// to the requester if they don't check source subnet.
+					// Skip this duplicate if -skip-unicast is set.
 					srcIP := srcUDP.IP
 					if outCfg.Override != nil {
 						srcIP = outCfg.Override
 					}
 					_ = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
 				}
-			} else if server.rawSender != nil && srcUDP != nil && server.keepSource {
+			} else if useRawSender && srcUDP != nil && server.keepSource {
 				// keepSource mode: use raw socket with original source IP
 				srcIP := srcUDP.IP
 				if outCfg.Override != nil {
@@ -1078,7 +1121,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				}
 				err = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
 			} else {
-				// Normal mode: use regular socket
+				// Normal mode (or IPv6): use regular socket
 				dst := &net.UDPAddr{IP: server.group, Port: server.port}
 				err = server.writePacket(payload, outIfIndex, outSrcIP, dst, outTTL)
 			}
@@ -1090,7 +1133,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 	}
 }
 
-func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource, strict bool, ttl int, proxyRecognizer ProxyPacketRecognizer, proxyTimeout time.Duration, proxyPort int) (*Server, error) {
+func newServer(interfaceList string, family IPFamily, group string, port int, overrides map[string]string, verbose, wildcard, keepSource, strict bool, ttl int, proxyRecognizer ProxyPacketRecognizer, proxyTimeout time.Duration, proxyPort int, skipUnicast ProxyPacketRecognizer) (*Server, error) {
 	ifaces, err := parseInterfaceList(interfaceList, family, overrides)
 	if err != nil {
 		return nil, err
@@ -1137,16 +1180,27 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 		proxyRecognizer: proxyRecognizer,
 		proxyTimeout:    proxyTimeout,
 		proxyPort:       proxyPort,
+		skipUnicast:     skipUnicast,
 	}
 
 	if keepSource || proxyRecognizer != nil {
-		// For keepSource, we need raw sockets on output interfaces.
-		// For proxy mode, we also need them on input interfaces (to send responses back).
-		rs, err := newRawSender(family, ifaces, proxyRecognizer != nil)
-		if err != nil {
-			return nil, fmt.Errorf("raw sender: %w", err)
+		if family == IPv4 {
+			// For keepSource, we need raw sockets on output interfaces.
+			// For proxy mode, we also need them on input interfaces (to send responses back).
+			rs, err := newRawSender(family, ifaces, proxyRecognizer != nil)
+			if err != nil {
+				return nil, fmt.Errorf("raw sender: %w", err)
+			}
+			s.rawSender = rs
+		} else {
+			// IPv6 raw sockets don't support IP_HDRINCL on Linux, so we can't spoof source IPs.
+			// Also, link-local addresses (fe80::) can't be forwarded across links anyway.
+			if keepSource {
+				s.keepSource = false
+			}
+			// Proxy mode still works for IPv6 - it uses regular sockets and our address as source.
+			// This is fine since SSDP responses contain LOCATION with the actual service URL.
 		}
-		s.rawSender = rs
 	}
 
 	if err := s.configureListener(); err != nil {
@@ -1188,8 +1242,11 @@ func main() {
 	strictFlag := flag.Bool("strict", false, "Only repeat packets from IPs on the interface's subnet")
 	ttlFlag := flag.Int("ttl", -1, "Multicast TTL (0=preserve incoming, >0=force value, -1=protocol default)")
 	proxyFlag := flag.String("proxy", "", "Proxy mode for unicast responses: ssdp")
+	proxy4Flag := flag.String("proxy4", "", "Proxy mode for IPv4 only (overrides -proxy for IPv4)")
+	proxy6Flag := flag.String("proxy6", "", "Proxy mode for IPv6 only (overrides -proxy for IPv6)")
 	proxyTimeFlag := flag.Int("proxy-time", 3, "Seconds to keep proxying responses after a request")
 	proxyPortFlag := flag.Int("proxy-port", 0, "Port for proxy responses (0 = same as main port)")
+	skipUnicastFlag := flag.String("skip-unicast", "", "Skip packets expecting a unicast response when not proxying: ssdp (overrides -protocol)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	verbose := flag.Bool("v", false, "Verbose output (debug)")
 
@@ -1267,26 +1324,36 @@ func main() {
 		ttl = *ttlFlag
 	}
 
-	// Proxy mode validation
-	var proxyRecognizer ProxyPacketRecognizer
+	// Proxy mode validation - can be set globally or per-family
 	proxyTimeout := time.Duration(*proxyTimeFlag) * time.Second
-	if *proxyFlag != "" {
-		if *keepSourceFlag {
-			log.Fatal("Cannot use -proxy with -keep-source (proxy replaces source for proxyable packets only)")
-		}
-		// Note: keepSource from preset is preserved - proxy mode only replaces
-		// source for detected proxyable packets (e.g., M-SEARCH), not all packets
-		var ok bool
-		proxyRecognizer, ok = proxyModes[*proxyFlag]
-		if !ok {
-			log.Fatalf("Unsupported proxy mode %q (supported: %s)", *proxyFlag, knownProxyModes())
-		}
-	}
-
-	// Proxy port defaults to the main port
 	proxyPort := *proxyPortFlag
 	if proxyPort == 0 {
 		proxyPort = port
+	}
+
+	getProxyRecognizer := func(family IPFamily) ProxyPacketRecognizer {
+		// Per-family flags override the global -proxy flag
+		proxyMode := *proxyFlag
+		if family == IPv4 && *proxy4Flag != "" {
+			proxyMode = *proxy4Flag
+		} else if family == IPv6 && *proxy6Flag != "" {
+			proxyMode = *proxy6Flag
+		}
+
+		if proxyMode == "" {
+			return nil
+		}
+		if proxyMode == "none" || proxyMode == "off" {
+			return nil // Explicitly disabled
+		}
+		if *keepSourceFlag {
+			log.Fatalf("Cannot use -proxy/-proxy4/-proxy6 with -keep-source (proxy replaces source for proxyable packets)")
+		}
+		recognizer, ok := proxyModes[proxyMode]
+		if !ok {
+			log.Fatalf("Unsupported proxy mode %q (supported: %s, none)", proxyMode, knownProxyModes())
+		}
+		return recognizer
 	}
 
 	validateGroup := func(addr string, family IPFamily) {
@@ -1318,16 +1385,61 @@ func main() {
 	ov4 := mustParseOverrides(*overrides4, "-override4")
 	ov6 := mustParseOverrides(*overrides6, "-override6")
 
+	// Warn if -keep-source explicitly requested for IPv6 (doesn't work - no raw socket support)
+	if *keepSourceFlag && *ifaces6 != "" {
+		log.Print("Warning: -keep-source has no effect for IPv6 (raw sockets not supported)")
+	}
+
+	// Skip unicast-expecting packets (e.g., M-SEARCH) when replies would be lost.
+	// - IPv4 with keepSource: replies routed correctly, don't skip
+	// - IPv4 with replace-source: replies lost, skip (from preset.SkipUnicast)
+	// - IPv6 without proxy: replies lost (can't keep source), skip (from preset.SkipUnicast)
+	// - With proxy + explicit -skip-unicast: skip the kept-source duplicate
+	getSkipUnicast := func(family IPFamily) ProxyPacketRecognizer {
+		// Determine the skip mode: flag overrides preset
+		skipMode := preset.SkipUnicast
+		explicitFlag := *skipUnicastFlag != ""
+		if explicitFlag {
+			skipMode = *skipUnicastFlag
+		}
+		if skipMode == "" || skipMode == "none" {
+			return nil
+		}
+
+		recognizer, ok := proxyModes[skipMode]
+		if !ok {
+			log.Fatalf("Unknown skip-unicast mode %q (supported: %s, none)", skipMode, knownProxyModes())
+		}
+
+		// If proxy is enabled for this family:
+		// - Without explicit -skip-unicast: don't skip anything (proxy handles, duplicates sent)
+		// - With explicit -skip-unicast: return recognizer to skip kept-source duplicates
+		if getProxyRecognizer(family) != nil {
+			if explicitFlag {
+				return recognizer // Explicit: skip kept-source duplicates
+			}
+			return nil // No explicit flag: proxy handles everything, send duplicates
+		}
+
+		// For IPv4 with keepSource, replies are routed correctly - don't skip
+		if family == IPv4 && keepSource {
+			return nil
+		}
+
+		// IPv6 without proxy, or IPv4 with replace-source: replies would be lost
+		return recognizer
+	}
+
 	var servers []*Server
 	if *ifaces4 != "" {
-		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource, strict, ttl, proxyRecognizer, proxyTimeout, proxyPort)
+		s, err := newServer(*ifaces4, IPv4, group4, port, ov4, *verbose, *wildcard, keepSource, strict, ttl, getProxyRecognizer(IPv4), proxyTimeout, proxyPort, getSkipUnicast(IPv4))
 		if err != nil {
 			log.Fatal(err)
 		}
 		servers = append(servers, s)
 	}
 	if *ifaces6 != "" {
-		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource, strict, ttl, proxyRecognizer, proxyTimeout, proxyPort)
+		s, err := newServer(*ifaces6, IPv6, group6, port, ov6, *verbose, *wildcard, keepSource, strict, ttl, getProxyRecognizer(IPv6), proxyTimeout, proxyPort, getSkipUnicast(IPv6))
 		if err != nil {
 			log.Fatal(err)
 		}
