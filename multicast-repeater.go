@@ -136,6 +136,7 @@ type InterfaceConfig struct {
 	Addresses []net.IP
 	Subnets   []*net.IPNet // For validating source IPs are from this network
 	Override  net.IP
+	NeedsRaw  bool // True if Override is not locally assigned (needs raw socket)
 	Direction Direction
 }
 
@@ -247,44 +248,6 @@ func buildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, ttl uint8,
 	return packet
 }
 
-func buildIPv6UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, hopLimit uint8, payload []byte) []byte {
-	const ipv6HeaderLen = 40
-	const udpHeaderLen = 8
-	udpLen := udpHeaderLen + len(payload)
-	totalLen := ipv6HeaderLen + udpLen
-
-	packet := make([]byte, totalLen)
-
-	// IPv6 header
-	packet[0] = 0x60 // Version 6
-	// packet[1:4] = Traffic class + Flow label (0)
-	packet[4] = byte(udpLen >> 8) // Payload length
-	packet[5] = byte(udpLen)
-	packet[6] = syscall.IPPROTO_UDP // Next header
-	packet[7] = hopLimit
-	copy(packet[8:24], srcIP.To16())
-	copy(packet[24:40], dstIP.To16())
-
-	// UDP header
-	packet[40] = byte(srcPort >> 8)
-	packet[41] = byte(srcPort)
-	packet[42] = byte(dstPort >> 8)
-	packet[43] = byte(dstPort)
-	packet[44] = byte(udpLen >> 8)
-	packet[45] = byte(udpLen)
-	// packet[46:48] = UDP checksum, required for IPv6
-
-	// Payload
-	copy(packet[48:], payload)
-
-	// UDP checksum (required for IPv6)
-	csum := udp6Checksum(srcIP, dstIP, packet[40:])
-	packet[46] = byte(csum >> 8)
-	packet[47] = byte(csum)
-
-	return packet
-}
-
 func ipChecksum(data []byte) uint16 {
 	var sum uint32
 	for i := 0; i+1 < len(data); i += 2 {
@@ -334,46 +297,6 @@ func udp4Checksum(srcIP, dstIP net.IP, udpPacket []byte) uint16 {
 		result = 0xffff // Per RFC 768, 0 means "no checksum", so use 0xffff instead
 	}
 	return result
-}
-
-func udp6Checksum(srcIP, dstIP net.IP, udpPacket []byte) uint16 {
-	// Pseudo-header for IPv6 UDP checksum
-	var sum uint32
-
-	// Source address (16 bytes)
-	src := srcIP.To16()
-	for i := 0; i < 16; i += 2 {
-		sum += uint32(src[i])<<8 | uint32(src[i+1])
-	}
-
-	// Destination address (16 bytes)
-	dst := dstIP.To16()
-	for i := 0; i < 16; i += 2 {
-		sum += uint32(dst[i])<<8 | uint32(dst[i+1])
-	}
-
-	// UDP length (4 bytes, upper 2 are zero for lengths < 65536)
-	udpLen := len(udpPacket)
-	sum += uint32(udpLen)
-
-	// Next header (1 byte, but padded to 4)
-	sum += uint32(syscall.IPPROTO_UDP)
-
-	// UDP packet
-	for i := 0; i+1 < udpLen; i += 2 {
-		if i == 6 {
-			continue // Skip checksum field itself
-		}
-		sum += uint32(udpPacket[i])<<8 | uint32(udpPacket[i+1])
-	}
-	if udpLen%2 == 1 {
-		sum += uint32(udpPacket[udpLen-1]) << 8
-	}
-
-	for sum > 0xffff {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-	return ^uint16(sum)
 }
 
 func parseInterfaceList(list string, family IPFamily, overrides map[string]string) (map[int]*InterfaceConfig, error) {
@@ -439,6 +362,7 @@ func parseInterfaceList(list string, family IPFamily, overrides map[string]strin
 		}
 
 		var overrideIP net.IP
+		var overrideNeedsRaw bool
 		if overrideStr, ok := overrides[ifaceName]; ok && overrideStr != "" {
 			overrideIP = net.ParseIP(overrideStr)
 			if overrideIP == nil {
@@ -447,6 +371,20 @@ func parseInterfaceList(list string, family IPFamily, overrides map[string]strin
 			if !family.matches(overrideIP) {
 				return nil, fmt.Errorf("override %s is not %v for %s", overrideIP, family, ifaceName)
 			}
+			// Check if the override IP is locally assigned
+			isLocal := false
+			for _, ip := range ips {
+				if ip.Equal(overrideIP) {
+					isLocal = true
+					break
+				}
+			}
+			if family == IPv6 && !isLocal {
+				// IPv6 requires local address (no raw socket support)
+				return nil, fmt.Errorf("override6 %s is not assigned to interface %s (IPv6 requires local address)", overrideIP, ifaceName)
+			}
+			// Non-local overrides need raw sockets
+			overrideNeedsRaw = !isLocal
 		}
 
 		result[ifaceObj.Index] = &InterfaceConfig{
@@ -454,6 +392,7 @@ func parseInterfaceList(list string, family IPFamily, overrides map[string]strin
 			Addresses: ips,
 			Subnets:   subnets,
 			Override:  overrideIP,
+			NeedsRaw:  overrideNeedsRaw,
 			Direction: dir,
 		}
 	}
@@ -847,8 +786,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 					}
 					err = server.rawSender.Send(r.ifIndex, fwdSrcIP, r.addr.IP, srcAddr.Port, r.addr.Port, 255, respBuf[:n])
 				} else {
-					// IPv6: use the proxy connection for the requester's interface
-					// Source will be our proxy listener address (link-local addresses don't work cross-subnet anyway)
+					// No raw socket: use the proxy connection for the requester's interface
 					fwdSrcIP = sourceByInterface[r.ifIndex]
 					if conn, ok := proxyConnsByIface[r.ifIndex]; ok {
 						_, err = conn.WriteToUDP(respBuf[:n], r.addr)
@@ -901,8 +839,8 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				return
 			}
 			proxyConn := conn.(*net.UDPConn)
-			// In wildcard mode, use interface index 0 as a placeholder
-			// (responses will be sent from the appropriate interface by kernel routing)
+			// In wildcard mode, all interfaces share the same connection.
+			// Kernel routing determines the source interface.
 			for ifIndex := range sourceByInterface {
 				proxyConnsByIface[ifIndex] = proxyConn
 			}
@@ -1118,13 +1056,14 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 						_ = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
 					}
 				} else if proxyConn := proxyConnsByIface[outIfIndex]; proxyConn != nil {
+					// No raw socket: send via proxyConn so responses come to proxy listener.
 					dst := &net.UDPAddr{IP: server.group, Port: server.port}
 					_, err = proxyConn.WriteToUDP(payload, dst)
 				} else {
 					err = fmt.Errorf("no proxy connection for interface %d", outIfIndex)
 				}
 			} else if useRawSender && server.keepSource {
-				// keepSource mode: use raw socket with original source IP
+				// keepSource mode: use raw socket with original source IP (or override)
 				srcIP := srcUDP.IP
 				if outCfg.Override != nil {
 					srcIP = outCfg.Override
@@ -1134,6 +1073,13 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 						inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, srcIP, srcUDP.Port, len(payload), outTTL)
 				}
 				err = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
+			} else if useRawSender && outCfg.NeedsRaw {
+				// Non-local override: must use raw socket to spoof the source IP
+				if server.verbose {
+					server.log("Repeating from %s %s to %s via %s (%d bytes, TTL %d, override)",
+						inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, outSrcIP, len(payload), outTTL)
+				}
+				err = server.rawSender.Send(outIfIndex, outSrcIP, server.group, server.port, server.port, outTTL, payload)
 			} else {
 				// Normal mode: use regular socket
 				if server.verbose {
@@ -1184,6 +1130,16 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 		return nil, fmt.Errorf("no output interfaces configured for %v", family)
 	}
 
+	// For IPv6 link-local scope multicast (ff02::), source must be link-local.
+	// Check if any override uses a non-link-local address, which won't work.
+	if family == IPv6 && len(groupIP) == 16 && groupIP[0] == 0xff && (groupIP[1]&0x0f) == 2 {
+		for _, cfg := range ifaces {
+			if cfg.Override != nil && !cfg.Override.IsLinkLocalUnicast() {
+				return nil, fmt.Errorf("override6 %s is not link-local; IPv6 link-local multicast (%s) requires link-local source address", cfg.Override, group)
+			}
+		}
+	}
+
 	s := &Server{
 		prefix:          family.String(),
 		family:          family,
@@ -1201,21 +1157,29 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 		skipUnicast:     skipUnicast,
 	}
 
-	if keepSource {
+	// Check if any interface has an override that requires raw sockets
+	needsRawForOverride := false
+	if family == IPv4 {
+		for _, cfg := range ifaces {
+			if cfg.NeedsRaw {
+				needsRawForOverride = true
+				break
+			}
+		}
+	}
+
+	if keepSource || needsRawForOverride {
 		if family == IPv4 {
-			// For keepSource, we need raw sockets to spoof source IPs.
+			// Raw sockets needed for keepSource or non-local overrides.
 			// Also include input interfaces if proxy mode is enabled (for response forwarding).
 			rs, err := newRawSender(family, ifaces, proxyRecognizer != nil)
 			if err != nil {
 				return nil, fmt.Errorf("raw sender: %w", err)
 			}
 			s.rawSender = rs
-		} else {
+		} else if keepSource {
 			// IPv6 raw sockets don't support IP_HDRINCL on Linux, so we can't spoof source IPs.
-			// Also, link-local addresses (fe80::) can't be forwarded across links anyway.
 			s.keepSource = false
-			// Proxy mode still works for IPv6 - it uses regular sockets and our address as source.
-			// This is fine since SSDP responses contain LOCATION with the actual service URL.
 		}
 	}
 

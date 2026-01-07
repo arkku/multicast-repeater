@@ -57,12 +57,15 @@ interfaces). This is largely untested, though.
 For mDNS, the outgoing address is replaced with the address of the interface
 the packet is repeated on. This can be overridden with `-keep-source` to use
 the original source address, or with interface specific hardcoded addresses
-with `-override4` and/or `-override6` (e.g., to override the IPv4 source address
-on two interfaces, `-override4 lan-main=192.168.0.1,lan-iot=192.168.1.1`). For
-other protocols (like SSDP), the original source address is kept so that unicast
-replies can be routed to the original sender. This can be overridden with the
-flag `-replace-source` (but it will break active search across VLANs unless you
-run some other program on the repeater to handle that).
+with `-override4` (e.g., to override the IPv4 source address on two interfaces,
+`-override4 lan-main=192.168.0.1,lan-iot=192.168.1.1`).
+
+For other protocols (like SSDP), the original source address is kept so that
+unicast replies can be routed to the original sender. This can be overridden
+with the flag `-replace-source` (but it will break active search across VLANs
+unless you also use `-proxy ssdp` to proxy the unicast responses). Note that
+for IPv6 link-local multicast (`ff02::`), the address will inevitably be the
+link-local address which can't be kept across interfaces.
 
 When the source address is replaced by the repeater's own IP address (e.g., with
 mDNS or with `-replace-source`), loop prevention defaults to simply checking

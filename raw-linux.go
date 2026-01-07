@@ -10,44 +10,40 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// rawSender sends UDP packets with arbitrary source IPs using raw sockets.
+// rawSender sends IPv4 UDP packets with arbitrary source IPs using raw sockets.
 // This is needed for protocols like SSDP where unicast replies must reach
-// the original sender, not the repeater.
+// the original sender, not the repeater. Only IPv4 is supported because Linux
+// IPv6 raw sockets do not support IP_HDRINCL for source IP spoofing.
 type rawSender struct {
-	family  IPFamily
 	sockets map[int]int // ifIndex -> raw socket fd
 }
 
 func newRawSender(family IPFamily, ifaces map[int]*InterfaceConfig, includeInput bool) (*rawSender, error) {
+	if family != IPv4 {
+		return nil, fmt.Errorf("raw sockets only supported for IPv4 (IPv6 lacks IP_HDRINCL)")
+	}
+
 	rs := &rawSender{
-		family:  family,
 		sockets: make(map[int]int),
 	}
 
 	for ifIndex, cfg := range ifaces {
-		// Output interfaces for keepSource mode, input interfaces for proxy mode (responses)
 		if !cfg.Direction.Output && !(includeInput && cfg.Direction.Input) {
 			continue
 		}
 
 		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
-		if family == IPv6 {
-			fd, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
-		}
 		if err != nil {
 			rs.Close()
 			return nil, fmt.Errorf("create raw socket for %s: %w", cfg.Interface.Name, err)
 		}
 
-		if family == IPv4 {
-			if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
-				syscall.Close(fd)
-				rs.Close()
-				return nil, fmt.Errorf("set IP_HDRINCL for %s: %w", cfg.Interface.Name, err)
-			}
+		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+			syscall.Close(fd)
+			rs.Close()
+			return nil, fmt.Errorf("set IP_HDRINCL for %s: %w", cfg.Interface.Name, err)
 		}
 
-		// Bind socket to specific interface (Linux-specific)
 		if err := unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, cfg.Interface.Name); err != nil {
 			syscall.Close(fd)
 			rs.Close()
@@ -72,18 +68,9 @@ func (rs *rawSender) Send(ifIndex int, srcIP, dstIP net.IP, srcPort, dstPort, tt
 		return fmt.Errorf("no raw socket for interface %d", ifIndex)
 	}
 
-	var packet []byte
-	var sa syscall.Sockaddr
-
-	if rs.family == IPv4 {
-		packet = buildIPv4UDPPacket(srcIP, dstIP, uint16(srcPort), uint16(dstPort), uint8(ttl), payload)
-		sa = &syscall.SockaddrInet4{Port: 0}
-		copy(sa.(*syscall.SockaddrInet4).Addr[:], dstIP.To4())
-	} else {
-		packet = buildIPv6UDPPacket(srcIP, dstIP, uint16(srcPort), uint16(dstPort), uint8(ttl), payload)
-		sa = &syscall.SockaddrInet6{Port: 0}
-		copy(sa.(*syscall.SockaddrInet6).Addr[:], dstIP.To16())
-	}
+	packet := buildIPv4UDPPacket(srcIP, dstIP, uint16(srcPort), uint16(dstPort), uint8(ttl), payload)
+	sa := &syscall.SockaddrInet4{Port: 0}
+	copy(sa.Addr[:], dstIP.To4())
 
 	return syscall.Sendto(fd, packet, 0, sa)
 }
