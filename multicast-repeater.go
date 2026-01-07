@@ -1080,15 +1080,6 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				outTTL = 255
 			}
 
-			if server.verbose {
-				extra := ""
-				if isProxyPacket {
-					extra = ", proxy"
-				}
-				server.log("Repeating from %s %s to %s (%d bytes, TTL %d%s)",
-					inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, len(payload), outTTL, extra)
-			}
-
 			var err error
 			outSrcIP := sourceByInterface[outIfIndex]
 
@@ -1102,6 +1093,10 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				if proxyListenPort == 0 {
 					proxyListenPort = server.port
 				}
+				if server.verbose {
+					server.log("Repeating from %s %s to %s via %s:%d (%d bytes, TTL %d, proxy)",
+						inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, outSrcIP, proxyListenPort, len(payload), outTTL)
+				}
 				err = server.rawSender.Send(outIfIndex, outSrcIP, server.group, proxyListenPort, server.port, outTTL, payload)
 				if err == nil && server.keepSource && server.skipUnicast == nil {
 					// Also send with original source IP - some devices may respond directly
@@ -1111,6 +1106,9 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 					if outCfg.Override != nil {
 						srcIP = outCfg.Override
 					}
+					if server.verbose {
+						server.log("  + duplicate via %s:%d (keep-source)", srcIP, srcUDP.Port)
+					}
 					_ = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
 				}
 			} else if useRawSender && srcUDP != nil && server.keepSource {
@@ -1119,9 +1117,17 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				if outCfg.Override != nil {
 					srcIP = outCfg.Override
 				}
+				if server.verbose {
+					server.log("Repeating from %s %s to %s via %s:%d (%d bytes, TTL %d, keep-source)",
+						inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, srcIP, srcUDP.Port, len(payload), outTTL)
+				}
 				err = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
 			} else {
 				// Normal mode (or IPv6): use regular socket
+				if server.verbose {
+					server.log("Repeating from %s %s to %s via %s (%d bytes, TTL %d)",
+						inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, outSrcIP, len(payload), outTTL)
+				}
 				dst := &net.UDPAddr{IP: server.group, Port: server.port}
 				err = server.writePacket(payload, outIfIndex, outSrcIP, dst, outTTL)
 			}
