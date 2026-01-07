@@ -1355,9 +1355,6 @@ func main() {
 		if proxyMode == "none" || proxyMode == "off" {
 			return nil // Explicitly disabled
 		}
-		if *keepSourceFlag {
-			log.Fatalf("Cannot use -proxy/-proxy4/-proxy6 with -keep-source (proxy replaces source for proxyable packets)")
-		}
 		recognizer, ok := proxyModes[proxyMode]
 		if !ok {
 			log.Fatalf("Unsupported proxy mode %q (supported: %s, none)", proxyMode, knownProxyModes())
