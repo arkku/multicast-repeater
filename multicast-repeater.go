@@ -6,12 +6,15 @@
 // can be specified as input only (listen on), output only (repeat to), or
 // both (the default).
 //
-// The packets are preserved exactly as they are, other than the source address
-// is changed to the address of the output interface. (The address can be
-// overridden for specific interfaces is desired.)
+// The packets are preserved exactly as they are. By default for mDNS, the
+// source address is changed to the address of the output interface; for
+// protocols with unicast replies (like SSDP), the original source address is
+// kept. This can be controlled with `-keep-source` and `-replace-source`.
 //
 // I made this with the help of AI because Avahi seems to modify the packets
-// and this causes some issues with more picky IoT devices.
+// and this causes some issues with more picky IoT devices. There is also some
+// proxy support for SSDP-like protocols that expect unicast replies to certain
+// queries.
 //
 // Note that this does not do anything for broadcast or unicast packets;
 // another reflector (or nftables `dup` rule) is needed for those.
@@ -711,6 +714,23 @@ func ipToKey(ip net.IP) [16]byte {
 // ProxyPacketRecognizer determines if a packet should be proxied (response forwarded to sender).
 type ProxyPacketRecognizer func(payload []byte) bool
 
+// reuseAddrListenConfig returns a ListenConfig that sets SO_REUSEADDR.
+func reuseAddrListenConfig() net.ListenConfig {
+	return net.ListenConfig{
+		Control: func(_, _ string, rawConn syscall.RawConn) error {
+			var controlError error
+			if err := rawConn.Control(func(fd uintptr) {
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+					controlError = fmt.Errorf("setsockopt SO_REUSEADDR: %w", err)
+				}
+			}); err != nil {
+				return err
+			}
+			return controlError
+		},
+	}
+}
+
 // isSSDPMSearch checks if a packet is an SSDP M-SEARCH request.
 func isSSDPMSearch(payload []byte) bool {
 	return len(payload) >= 8 && string(payload[:8]) == "M-SEARCH"
@@ -815,12 +835,21 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 
 				// Determine how to forward the response
 				var err error
+				var fwdSrcIP net.IP
 				if server.rawSender != nil && server.family == IPv4 {
-					// IPv4: use raw socket to preserve original source IP
-					err = server.rawSender.Send(r.ifIndex, srcAddr.IP, r.addr.IP, srcAddr.Port, r.addr.Port, 255, respBuf[:n])
+					// IPv4: use raw socket
+					if server.keepSource {
+						// Preserve original source IP so client knows which device responded
+						fwdSrcIP = srcAddr.IP
+					} else {
+						// Replace source with our IP (consistent with -replace-source)
+						fwdSrcIP = sourceByInterface[r.ifIndex]
+					}
+					err = server.rawSender.Send(r.ifIndex, fwdSrcIP, r.addr.IP, srcAddr.Port, r.addr.Port, 255, respBuf[:n])
 				} else {
 					// IPv6: use the proxy connection for the requester's interface
 					// Source will be our proxy listener address (link-local addresses don't work cross-subnet anyway)
+					fwdSrcIP = sourceByInterface[r.ifIndex]
 					if conn, ok := proxyConnsByIface[r.ifIndex]; ok {
 						_, err = conn.WriteToUDP(respBuf[:n], r.addr)
 					} else {
@@ -833,7 +862,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 						server.log("Proxy forward to %s failed: %v", r.addr, err)
 					}
 				} else if server.verbose {
-					server.log("Proxy forwarded response from %s to %s (%d bytes)", srcAddr, r.addr, n)
+					server.log("Proxy forwarded response from %s to %s via %s (%d bytes)", srcAddr, r.addr, fwdSrcIP, n)
 				}
 			}
 			proxyMu.Unlock()
@@ -864,19 +893,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			var proxyListenConfig net.ListenConfig
 			if proxyListenPort == server.port {
 				// Same port as main listener: use SO_REUSEADDR for coexistence
-				proxyListenConfig = net.ListenConfig{
-					Control: func(_, _ string, rawConn syscall.RawConn) error {
-						var controlError error
-						if err := rawConn.Control(func(fd uintptr) {
-							if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
-								controlError = fmt.Errorf("setsockopt SO_REUSEADDR: %w", err)
-							}
-						}); err != nil {
-							return err
-						}
-						return controlError
-					},
-				}
+				proxyListenConfig = reuseAddrListenConfig()
 			}
 			conn, err := proxyListenConfig.ListenPacket(context.Background(), network, listenAddr)
 			if err != nil {
@@ -909,19 +926,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				var proxyListenConfig net.ListenConfig
 				if proxyListenPort == server.port {
 					// Same port as main listener: use SO_REUSEADDR for coexistence
-					proxyListenConfig = net.ListenConfig{
-						Control: func(_, _ string, rawConn syscall.RawConn) error {
-							var controlError error
-							if err := rawConn.Control(func(fd uintptr) {
-								if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
-									controlError = fmt.Errorf("setsockopt SO_REUSEADDR: %w", err)
-								}
-							}); err != nil {
-								return err
-							}
-							return controlError
-						},
-					}
+					proxyListenConfig = reuseAddrListenConfig()
 				}
 				conn, err := proxyListenConfig.ListenPacket(context.Background(), network, listenAddr)
 				if err != nil {
@@ -1087,8 +1092,8 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 			// so we can't spoof source IPs. Fall back to regular socket for IPv6.
 			useRawSender := server.rawSender != nil && server.family == IPv4
 
-			if isProxyPacket && useRawSender {
-				// Proxy M-SEARCH: send with our IP:proxyPort so responses come to our proxy listener
+			if isProxyPacket {
+				// Proxy M-SEARCH: send with our IP:proxyPort so responses come to proxy listener
 				proxyListenPort := server.proxyPort
 				if proxyListenPort == 0 {
 					proxyListenPort = server.port
@@ -1097,21 +1102,28 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 					server.log("Repeating from %s %s to %s via %s:%d (%d bytes, TTL %d, proxy)",
 						inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, outSrcIP, proxyListenPort, len(payload), outTTL)
 				}
-				err = server.rawSender.Send(outIfIndex, outSrcIP, server.group, proxyListenPort, server.port, outTTL, payload)
-				if err == nil && server.keepSource && server.skipUnicast == nil {
-					// Also send with original source IP - some devices may respond directly
-					// to the requester if they don't check source subnet.
-					// Skip this duplicate if -skip-unicast is set.
-					srcIP := srcUDP.IP
-					if outCfg.Override != nil {
-						srcIP = outCfg.Override
+				if useRawSender {
+					err = server.rawSender.Send(outIfIndex, outSrcIP, server.group, proxyListenPort, server.port, outTTL, payload)
+					if err == nil && server.keepSource && server.skipUnicast == nil {
+						// Also send with original source IP - some devices may respond directly
+						// to the requester if they don't check source subnet.
+						// Skip this duplicate if -skip-unicast is set.
+						srcIP := srcUDP.IP
+						if outCfg.Override != nil {
+							srcIP = outCfg.Override
+						}
+						if server.verbose {
+							server.log("  + duplicate via %s:%d (keep-source)", srcIP, srcUDP.Port)
+						}
+						_ = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
 					}
-					if server.verbose {
-						server.log("  + duplicate via %s:%d (keep-source)", srcIP, srcUDP.Port)
-					}
-					_ = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
+				} else if proxyConn := proxyConnsByIface[outIfIndex]; proxyConn != nil {
+					dst := &net.UDPAddr{IP: server.group, Port: server.port}
+					_, err = proxyConn.WriteToUDP(payload, dst)
+				} else {
+					err = fmt.Errorf("no proxy connection for interface %d", outIfIndex)
 				}
-			} else if useRawSender && srcUDP != nil && server.keepSource {
+			} else if useRawSender && server.keepSource {
 				// keepSource mode: use raw socket with original source IP
 				srcIP := srcUDP.IP
 				if outCfg.Override != nil {
@@ -1123,7 +1135,7 @@ func (server *Server) Run(wg *sync.WaitGroup, errCh chan<- error) {
 				}
 				err = server.rawSender.Send(outIfIndex, srcIP, server.group, srcUDP.Port, server.port, outTTL, payload)
 			} else {
-				// Normal mode (or IPv6): use regular socket
+				// Normal mode: use regular socket
 				if server.verbose {
 					server.log("Repeating from %s %s to %s via %s (%d bytes, TTL %d)",
 						inCfg.Interface.Name, srcAddr, outCfg.Interface.Name, outSrcIP, len(payload), outTTL)
@@ -1189,10 +1201,10 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 		skipUnicast:     skipUnicast,
 	}
 
-	if keepSource || proxyRecognizer != nil {
+	if keepSource {
 		if family == IPv4 {
-			// For keepSource, we need raw sockets on output interfaces.
-			// For proxy mode, we also need them on input interfaces (to send responses back).
+			// For keepSource, we need raw sockets to spoof source IPs.
+			// Also include input interfaces if proxy mode is enabled (for response forwarding).
 			rs, err := newRawSender(family, ifaces, proxyRecognizer != nil)
 			if err != nil {
 				return nil, fmt.Errorf("raw sender: %w", err)
@@ -1201,9 +1213,7 @@ func newServer(interfaceList string, family IPFamily, group string, port int, ov
 		} else {
 			// IPv6 raw sockets don't support IP_HDRINCL on Linux, so we can't spoof source IPs.
 			// Also, link-local addresses (fe80::) can't be forwarded across links anyway.
-			if keepSource {
-				s.keepSource = false
-			}
+			s.keepSource = false
 			// Proxy mode still works for IPv6 - it uses regular sockets and our address as source.
 			// This is fine since SSDP responses contain LOCATION with the actual service URL.
 		}
@@ -1221,14 +1231,7 @@ func knownProtocols() string {
 	for name := range protocolPresets {
 		names = append(names, name)
 	}
-	// Sort for deterministic help output.
-	for i := range names {
-		for j := i + 1; j < len(names); j++ {
-			if names[i] > names[j] {
-				names[i], names[j] = names[j], names[i]
-			}
-		}
-	}
+	sort.Strings(names)
 	return strings.Join(names, ", ")
 }
 
