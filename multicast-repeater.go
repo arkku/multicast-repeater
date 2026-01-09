@@ -70,12 +70,14 @@ type ProtocolPreset struct {
 }
 
 var protocolPresets = map[string]ProtocolPreset{
-	"mdns":         {"224.0.0.251", "ff02::fb", 5353, false, 255, ""},
-	"ssdp":         {"239.255.255.250", "ff02::c", 1900, true, 0, "ssdp"},
-	"ws-discovery": {"239.255.255.250", "ff02::c", 3702, true, 0, "ssdp"},
-	"llmnr":        {"224.0.0.252", "ff02::1:3", 5355, true, 255, ""},
-	"coap":         {"224.0.1.187", "ff02::fd", 5683, true, 0, ""},
-	"slp":          {"239.255.255.253", "ff02::116", 427, true, 0, ""},
+	"mdns":            {"224.0.0.251", "ff02::fb", 5353, false, 255, ""},
+	"ssdp":            {"239.255.255.250", "ff02::c", 1900, true, 0, "ssdp"},
+	"ws-discovery":    {"239.255.255.250", "ff02::c", 3702, true, 0, "ssdp"},
+	"llmnr":           {"224.0.0.252", "ff02::1:3", 5355, true, 255, ""},
+	"coap":            {"224.0.1.187", "ff02::fd", 5683, true, 0, ""},
+	"slp":             {"239.255.255.253", "ff02::116", 427, true, 0, ""},
+	"unifi-discovery": {"233.89.188.1", "", 10001, true, 0, ""},
+	"unifi-stats":     {"239.254.127.63", "", 48000, true, 0, ""},
 }
 
 var defaultPreset = protocolPresets["mdns"]
@@ -1342,7 +1344,12 @@ func main() {
 		validateGroup(group4, IPv4)
 	}
 	if *ifaces6 != "" {
-		validateGroup(group6, IPv6)
+		if group6 == "" {
+			log.Print("Note: protocol has no IPv6 multicast group, skipping IPv6")
+			*ifaces6 = ""
+		} else {
+			validateGroup(group6, IPv6)
+		}
 	}
 
 	mustParseOverrides := func(input, name string) map[string]string {
